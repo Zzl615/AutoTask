@@ -286,7 +286,8 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             return layout to input
         }
 
-        val serviceNames = AsrServiceType.all.map { AsrServiceType.titleOf(it).text }
+        val serviceTypes = AsrServiceType.all
+        val serviceNames = serviceTypes.map { AsrServiceType.titleOf(it).text }
         val serviceInput = MaterialAutoCompleteTextView(context).apply {
             inputType = InputType.TYPE_NULL
             setAdapter(
@@ -297,10 +298,15 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
                 )
             )
             setText(serviceNames[AsrServiceType.indexOf(selectedService)], false)
+            setOnClickListener { showDropDown() }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) post { showDropDown() }
+            }
         }
         val serviceLayout = TextInputLayout(context).apply {
             hint = R.string.asr_service.text
             boxBackgroundMode = TextInputLayout.BOX_BACKGROUND_OUTLINE
+            endIconMode = TextInputLayout.END_ICON_DROPDOWN_MENU
             addView(serviceInput)
         }
 
@@ -333,14 +339,15 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
         }
 
         fun updateAlibabaFields() {
-            val showAlibabaFields = selectedService != AsrServiceType.SYSTEM
+            val showAlibabaFields = selectedService == AsrServiceType.AUTO ||
+                    AsrServiceType.requiresConfig(selectedService)
             appKeyLayout.isVisible = showAlibabaFields
             accessKeyIdLayout.isVisible = showAlibabaFields
             accessKeySecretLayout.isVisible = showAlibabaFields
         }
 
         serviceInput.setOnItemClickListener { _, _, position, _ ->
-            selectedService = AsrServiceType.all[position]
+            selectedService = serviceTypes[position]
             updateAlibabaFields()
         }
         updateAlibabaFields()

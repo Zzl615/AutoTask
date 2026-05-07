@@ -144,23 +144,22 @@ class VoiceCommandService : Service(), RecognitionListener {
 
     private fun startListening() {
         if (isStopping || isListening) return
-        when (Preferences.speechRecognitionService) {
-            AsrServiceType.SYSTEM -> {
-                if (!startSystemListening()) {
-                    notifyAndStop(getString(R.string.voice_command_no_recognizer))
-                }
-            }
+        val selectedService = Preferences.speechRecognitionService
+        AsrServiceType.candidatesOf(selectedService).forEach { service ->
+            if (startListeningWith(service)) return
+        }
+        val message = when (selectedService) {
+            AsrServiceType.SYSTEM -> getString(R.string.voice_command_no_recognizer)
+            else -> getString(R.string.voice_command_alibaba_config_missing)
+        }
+        notifyAndStop(message)
+    }
 
-            AsrServiceType.ALIBABA -> startAlibabaListeningOrStop()
-            else -> {
-                if (!startSystemListening()) {
-                    if (AsrServiceType.isAlibabaConfigured()) {
-                        startAlibabaListeningOrStop()
-                    } else {
-                        notifyAndStop(getString(R.string.voice_command_alibaba_config_missing))
-                    }
-                }
-            }
+    private fun startListeningWith(service: Int): Boolean {
+        return when (service) {
+            AsrServiceType.SYSTEM -> startSystemListening()
+            AsrServiceType.ALIBABA -> startAlibabaListening()
+            else -> false
         }
     }
 
@@ -188,10 +187,9 @@ class VoiceCommandService : Service(), RecognitionListener {
         return true
     }
 
-    private fun startAlibabaListeningOrStop() {
+    private fun startAlibabaListening(): Boolean {
         if (!AsrServiceType.isAlibabaConfigured()) {
-            notifyAndStop(getString(R.string.voice_command_alibaba_config_missing))
-            return
+            return false
         }
         isListening = true
         updateUiState {
@@ -222,6 +220,7 @@ class VoiceCommandService : Service(), RecognitionListener {
                 notifyAndStop(message)
             }
         }
+        return true
     }
 
     private fun notifyAndStop(message: String) {
