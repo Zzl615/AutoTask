@@ -8,8 +8,8 @@
 - **协议**：Apache-2.0
 - **上游仓库**：[xjunz/AutoTask](https://github.com/xjunz/AutoTask)（当前 git remote `origin = git@github.com:IanVzs/AutoTask.git` 为派生仓库）
 - **当前版本**：`2.0.0` / versionCode `200`（见根目录 `gradle.properties`）
-- **最低 / 目标 SDK**：`minSdk 24` / `targetSdk 34` / `compileSdk 34`
-- **签名配置**：需要在根目录提供 `local.properties`（`storeFile`/`storePassword`/`keyAlias`/`keyPassword`）
+- **最低 / 目标 SDK**：`minSdk 24` / `targetSdk 36` / `compileSdk 36.1`
+- **签名配置**：可选；需要自定义签名时在未提交的 `local.properties` 提供 `storeFile`/`storePassword`/`keyAlias`/`keyPassword`
 
 ## 一句话定位
 
@@ -52,8 +52,8 @@
 
 | 组件 | 版本 / 备注 |
 |------|-------------|
-| Kotlin | 1.8.21 |
-| Android Gradle Plugin | 8.1.2 |
+| Kotlin | 2.2.0 |
+| Android Gradle Plugin | 8.13.0 |
 | Coroutines | kotlinx 1.7.3 |
 | Serialization | kotlinx 1.6.21（JSON，`XTaskDTO` / `AppletDTO` 序列化） |
 | Ktor | 2.3.5（`api.Client` HTTP） |

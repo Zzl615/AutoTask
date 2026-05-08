@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import top.xjunz.tasker.R
 import top.xjunz.tasker.databinding.FragmentVoiceCommandBinding
@@ -171,8 +172,22 @@ class VoiceCommandFragment : BaseFragment<FragmentVoiceCommandBinding>(), Scroll
         private var records: List<VoiceCommandRecord> = emptyList()
 
         fun submitList(newRecords: List<VoiceCommandRecord>) {
+            val oldRecords = records
+            val diffResult = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                override fun getOldListSize(): Int = oldRecords.size
+
+                override fun getNewListSize(): Int = newRecords.size
+
+                override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                    return oldRecords[oldItemPosition].timestamp == newRecords[newItemPosition].timestamp
+                }
+
+                override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                    return oldRecords[oldItemPosition] == newRecords[newItemPosition]
+                }
+            })
             records = newRecords
-            notifyDataSetChanged()
+            diffResult.dispatchUpdatesTo(this)
         }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {

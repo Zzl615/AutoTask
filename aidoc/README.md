@@ -18,6 +18,7 @@
 9. 排查已知坑点：`10-troubleshooting.md`。
 10. 术语与简写：`11-glossary.md`。
 11. 发版说明：`12-release-notes.md`。
+12. 尚未完成的工程优化：`13-todo.md`。
 
 ## 文件索引
 
@@ -35,6 +36,7 @@
 | [`10-troubleshooting.md`](10-troubleshooting.md) | 已知坑点、常见 bug、排查入口 |
 | [`11-glossary.md`](11-glossary.md) | 术语表 |
 | [`12-release-notes.md`](12-release-notes.md) | 发版说明、版本重点与验证记录 |
+| [`13-todo.md`](13-todo.md) | 尚未完成的工程优化待办 |
 
 ## 重要约定
 

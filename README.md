@@ -33,7 +33,28 @@
 
 ## 构建
 
-如果你想构建此项目，请将代码`git clone`到本地后，在**Android Studio**打开，并在项目根目录下建立`local.properties`(如果不存在的话)，在其中配置自定义签名信息:
+构建环境要求：
+
+- JDK 18。请通过 `JAVA_HOME`、IDE 或用户级 `~/.gradle/gradle.properties` 配置本机 JDK，不要把个人路径提交到仓库。
+- Android SDK Platform 36、Build Tools 36.0.0。
+- Gradle 由仓库内 wrapper 管理，直接使用 `./gradlew` 或 `make` 即可。
+
+常用命令：
+
+```bash
+make help
+make debug
+make test
+make lint
+```
+
+如果 Android SDK 不在默认位置，可以在根目录创建未提交的 `local.properties`：
+
+```properties
+sdk.dir=/path/to/Android/Sdk
+```
+
+签名配置仅在你需要使用自己的签名打包时填写，同样放在未提交的 `local.properties`：
 
 ```properties
 storeFile=xxx
@@ -41,6 +62,8 @@ storePassword=xxx
 keyAlias=xxx
 keyPassword=xxx
 ```
+
+多台设备同时连接时，`make install-apk`、`make run` 等 adb 命令可以通过 `DEVICE=<adb 序列号>` 指定设备。
 
 ## 注意事项
 
