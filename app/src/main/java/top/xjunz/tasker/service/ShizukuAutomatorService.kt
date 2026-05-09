@@ -190,6 +190,39 @@ class ShizukuAutomatorService : IRemoteAutomatorService.Stub, AutomatorService {
         }
     }
 
+    /**
+     * 跨进程读屏：
+     * - 主进程调用：转发到 AIDL `delegate.captureUiSnapshotJson(...)`，让特权进程读屏。
+     * - 特权进程调用：本地用 `uiAutomation.rootInActiveWindow + freeze + AiNodeTreeCompactor`。
+     *
+     * 失败一律返回空字符串，让调用方走"下一轮重试"的兜底逻辑。
+     */
+    override fun captureUiSnapshotJson(maxNodes: Int, maxTextLen: Int): String {
+        if (isAppProcess) {
+            return runCatching { delegate.captureUiSnapshotJson(maxNodes, maxTextLen) }
+                .getOrDefault("")
+        }
+        ensurePrivilegedProcess()
+        val root = runCatching { uiAutomation.rootInActiveWindow }.getOrNull() ?: return ""
+        val frozen = runCatching {
+            top.xjunz.tasker.task.inspector.StableNodeInfo.Companion.run { root.freeze() }
+        }.getOrNull() ?: return ""
+        // 物理像素走 DisplayManagerBridge（@Anywhere），特权进程也能拿到。
+        val realSize = top.xjunz.tasker.bridge.DisplayManagerBridge.size
+        val compInfo = runCatching { a11yEventDispatcher.getCurrentComponentInfo() }.getOrNull()
+        return runCatching {
+            top.xjunz.tasker.task.inspector.shared.AiNodeTreeCompactor.compactToJson(
+                rootNode = frozen,
+                screenWidth = realSize.x,
+                screenHeight = realSize.y,
+                packageName = compInfo?.packageName,
+                activityName = compInfo?.activityName,
+                maxNodes = maxNodes,
+                maxTextLen = maxTextLen
+            )
+        }.getOrDefault("")
+    }
+
     override fun releaseWakeLock() {
         if (isPrivilegedProcess) {
             super.releaseWakeLock()

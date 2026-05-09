@@ -192,21 +192,37 @@ AI 的能力扩大后，必须有用户可理解的授权模型：
 
 后续若加入"识别 → 嵌入向量 → ANN 搜索"做更鲁棒的本地匹配，应在第 1 步内完成，仍要保证"代码命中即直接执行，不调 AI"这条铁律。
 
-## 7.1 第二阶段：屏幕感知与可执行 UI 操作
+## 7.1 第二阶段：屏幕感知与可执行 UI 操作（agent loop 形态）
 
-第一阶段 MVP 让 AI 学会"理解 / 调度任务 / 生成低风险草稿"，但 AI 仍然看不到当前界面，无法生成"在 X 处点击 / 在 Y 输入框写字"这类真正贴近 App 内自动化的步骤。第二阶段的核心目标就是补齐这一空白。
+第一阶段 MVP 让 AI 学会"理解 / 调度任务 / 生成低风险草稿"，但 AI 仍然看不到当前界面，无法生成"在 X 处点击 / 在 Y 输入框写字"这类真正贴近 App 内自动化的步骤。第二阶段在 2026-05-09 直接落地为 **agent loop 形态**，详见 `16-ai-inspector-capability.md` §13。
 
-里程碑（细节见 `16-ai-inspector-capability.md`）：
+**为什么不再走 Phase 2.A/B/C 三段式**：planner-only（一次性出几步 Applet 草稿）的能力上限就是规则的低配版；真正能让用户感到"AI 不可替代"的是"读屏幕 → 决策 → 执行 → 看结果 → 再决策"的 agent 循环。三段式开发节奏会持续输出"看起来在做但用户不会用"的中间产物，浪费一两个开发周期。
 
-- **Phase 2.A · 只读快照**：新增 `AiCapability.InspectScreen`、`ScreenSnapshotProvider`、`AiNodeTreeCompactor`、`AiUiSnapshot`，让 AI 能"看一眼当前屏幕"并向用户描述。默认关闭，首次启用必须授权。
-- **Phase 2.B · 可执行节点**：新增 `click_ui_object_by` / `wait_for_ui_object` 等 capability，配合新的 `AiCapability.ClickUi` / `WaitForUi`；`AiTaskDraftConverter` 把 AI 步骤翻译成 `containsUiObject + Criterion + Action` 组合，复用 `acceptAppletsFromAutoClick` 同款管道。
-- **Phase 2.C · 写入与兜底**：补 `set_text_in_ui_object_by`（敏感字段 redact 必生效）+ `clickIfExits` / `clickUiObjectWithText` 兜底 capability；引入屏幕快照的成本与频率限制。
+**当前已落地（2026-05-09）**：
 
-该阶段的不可妥协边界：
+- 新增包 `app/src/main/java/top/xjunz/tasker/ai/agent/`：`AiUiSnapshot` / `ScreenSnapshotProvider` / `AiAgentAction` / `AiAgentExecutor` / `AiAgentPlanner` / `AiAgentSession` / `AiTaskScope` 七个文件。
+- `Preferences` 加 `aiAgentEnabled`（默认 **true**）/ `aiAgentMaxSteps` (30) / `aiAgentMaxSeconds` (90)。
+- `VoiceCommandService.runAiInterpretation` 在 `CreateTaskDraft` 分支启动 `runAgentFlow`：`planSession → 等用户授权 → 启 AiAgentSession → 每步追加到 records`。
+- `VoiceCommandFragment` 弹任务级授权对话框，AboutFragment AI 配置弹窗加 agent 开关。
 
-- AI 链路不允许实例化 `FloatingInspector` 或写 `InspectorViewModel`，否则会污染用户当前 Inspector UI 状态；只通过 `A11yAutomatorService.rootInActiveWindow + StableNodeInfo.freeze()` 取数据。
-- 节点树进入模型前**必须**经过裁剪（节点上限、文本截断、敏感字段 redact）。
-- 模型输出的节点引用一律是定位条件 `AiUiTarget`，由本地代码二次定位真实节点；不允许 AI 直接操作 bounds 坐标点击。
+**仅四条不可妥协边界**（取代旧的"严格 redact / 节点上限 / 多重门禁"）：
+
+1. 任务级授权，一次确认整段会话。
+2. App scope 锁：切到非授权 App 自动停。
+3. 步数 / 时长上限：默认 30 步 / 90 秒。
+4. 未授权能力即停：每步执行前校验 `requiredCapability()`。
+
+**仍保留的工程纪律**：
+
+- AI 链路不允许实例化 `FloatingInspector` / `InspectorViewModel`；只通过 `A11yAutomatorService.rootInActiveWindow + StableNodeInfo.freeze()` 取数据。
+- AI 输出的节点引用一律是 `AiUiTarget` 定位条件，由 `AiAgentExecutor` 在最新真实 AccessibilityNodeInfo 树里二次定位；**不允许** AI 直接操作 bounds 坐标点击。
+- 节点树进入模型前经过 `AiNodeTreeCompactor` 裁剪（默认 80 节点 / 80 字符上限），但具体 redact 规则等运行体验稳定后再加。
+
+**2026-05-09 增量里程碑**（详见 `16-ai-inspector-capability.md` §13.7）：
+
+- **公共能力抽取 `task/inspector/shared/`**：`UiTreeQuery` / `NodeCriteriaExtractor` / `NodeToActionAssembler` / `AiUiTargetExtractor` 四个文件，让 inspector + agent 共享同一份"节点 → Applet / 节点 → AiUiTarget"逻辑，为 follow-up 2.1（agent 跑完保存为任务）打地基。
+- **决策面板 `ai/agent/overlay/`**：每步 agent action 在执行前通过悬浮窗征询用户**同意 / 拒绝 / 换一个**，倒计时默认同意；用户介入写入 history 喂给下一轮 AI 做自我学习。
+- 用户可见的边界从"任务级一次性授权"加强为"每步可干预 + 任务级授权"，AI 自由度未变（默认 3 秒倒计时同意），但风险从"开闸放水"降到"协作闯关"。
 
 ## 8. 风险清单
 

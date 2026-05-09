@@ -2,20 +2,30 @@
 
 本文件只记录尚未完成的后续优化项；已完成的构建体验、CI、lint error 修复和低风险 warning 清理不再列入。
 
+> **开工前硬约束**（来自 README.md）：碰任何 service / bridge / task / AIDL / 跨进程的事，
+> **必先**读 `02 §2` + `05` + `09`，并在 todo 里加一条"已对照 aidoc"。这条没做就动手，
+> 大概率重蹈 2026-05-09 复盘里的覆辙（`aidoc/16-ai-inspector-capability.md` §13.8）。
+
 ## 高优先级
 
 1. **AI 接入第一阶段 MVP**
    - 范围：`app/src/main/java/top/xjunz/tasker/ai/`、`voice/`、`ui/voice/`、`Preferences.kt`、`res/values/strings.xml`。
    - 目标：建立 AI Provider 抽象和 OpenAI-compatible 配置，让语音识别文本进入 AI 意图理解，输出"执行现有任务 / 创建任务草稿 / 需要授权的行动计划 / 需要澄清 / 无法理解"等受控结果。
 
-2. **AI 第二阶段：屏幕感知与可执行 UI 操作**
-   - 范围：`app/src/main/java/top/xjunz/tasker/ai/inspector/`（新增）、`ai/draft/AiTaskDraftConverter.kt`、`ai/capability/AiTaskCapabilityCatalog.kt`、`ai/agent/VoiceAiInterpreter.kt`、`ai/model/AiCapability.kt`、`ai/policy/AiRiskAssessor.kt`、`ai/AiCenter.kt`、`ui/main/AboutFragment.kt`（AI 配置弹窗里加屏幕感知开关）。
-   - 设计依据：`16-ai-inspector-capability.md`。
-   - 子任务：
-     - **2.A 只读快照**：新增 `ScreenSnapshotProvider`、`AiNodeTreeCompactor`、`AiUiSnapshot`、`AiCapability.InspectScreen`、首次启用授权弹窗；让 AI 能列出当前屏幕主要节点用于验证。
-     - **2.B 可执行节点**：新增 capability `click_ui_object_by` / `wait_for_ui_object` 与对应 `AiCapability.ClickUi` / `WaitForUi`；抽 `UiObjectFlowAssembler` 让 `NodeInfoOverlay` / `AppletSelectorViewModel.acceptAppletsFromAutoClick` 与 `AiTaskDraftConverter` 共用；决策记录展示 AI 看到的子集与最终选择的节点。
-     - **2.C 写入与兜底**：新增 `set_text_in_ui_object_by`（敏感字段 redact 必生效）、`clickUiObjectWithText` / `clickIfExits` 兜底 capability；引入屏幕快照成本与频率限制 `AiCostLimit`。
-   - 不可妥协边界：AI 链路不实例化 `FloatingInspector` / 不写 `InspectorViewModel`；节点引用一律是定位条件 `AiUiTarget`，由本地代码二次定位，禁止直接用 bounds 坐标点击。
+2. **AI 第二阶段：屏幕感知与可执行 UI 操作**（**已转向 agent loop 形态，2026-05-09 一次性落地**）
+   - 范围（已落地）：`app/src/main/java/top/xjunz/tasker/ai/agent/` 新增 7 个文件（`AiUiSnapshot` / `ScreenSnapshotProvider` / `AiAgentAction` / `AiAgentExecutor` / `AiAgentPlanner` / `AiAgentSession` / `AiTaskScope`），`Preferences` 加 agent 三项配置，`VoiceCommandService.runAgentFlow`，`VoiceCommandFragment` 任务级授权对话框，`AboutFragment` AI 配置加 agent 开关。
+   - 设计依据：`16-ai-inspector-capability.md` §13、`14-ai-integration.md` §7.1、`15-ai-working-notes.md` §12。
+   - **已不再适用**的旧子任务：原本计划的 Phase 2.A 只读 → 2.B 可执行 → 2.C 写入兜底三段式被合并成一次性 agent loop 闭环，不再分批落地。
+   - **后续 follow-up 子任务**（明天起按需推进）：
+     - **2.1 把 agent 跑过的步骤"另存为任务"**：跑完后给 records 卡片加一个"保存为任务"按钮，把 `AiAgentStepRecord` 序列翻译成 `RootFlow + Do + Applet` 走 `FlowEditor`。复用已有的 `AiTaskDraftConverter` + `UiObjectFlowAssembler` 思路。
+     - **2.2 包名校验与用户编辑**：`runAgentFlow` 拿到 `plan.targetAppPackage` 后用 `PackageManagerBridge.loadPackageInfo` 校验存在性；任务级授权对话框允许用户手改包名 / 加多个包。
+     - **2.3 中止运行中 session 的 UI 入口**：在记录卡片或浮动 toast 里加"停止 agent"按钮，调用 `coroutineScope.cancel()` 或新增 `AiAgentSession.cancel()`。
+     - **2.4 节点压缩 redact**：把 `viewId` 命中 password / cvv / bank / phone / id_card 等关键词的节点的 `text` 强制 `redacted=true`，不上传明文。
+     - **2.5 高风险 action 黑名单**：在 `AiAgentExecutor` 里对命中支付 / 转账 / 删除 / 通话相关关键词的目标节点做运行时拒绝。
+     - **2.6 prompt 优化**：观察实跑 token 消耗，按需做"只发 diff 节点 / 仅发可点击 + editable / 历史压缩为摘要"等节流。
+     - **2.7 V2 节点 picker：FloatingInspector 接管"换一个"按钮**：当前 `CandidateListPicker` (V1) 在决策面板内嵌候选列表；V2 把 `InspectorPickerStub` 替换成 `FloatingInspectorPicker`，弹起 inspector 让用户在屏幕上**直接点真节点**。`AiAgentNodePicker` 接口已经预留好，决策面板 UI / `AiAgentDecision` / session 集成都不需要改。
+     - **2.8 agent 决策配置 UI**：`Preferences.aiAgentConfirmMode/Seconds/AllowReplace` 已有默认值（`auto_approve / 3 秒 / true`），覆盖常见场景；下一轮在 AI 配置弹窗加一个 "AI agent 决策" 子区块，含 4 种模式 spinner / 倒计时秒数 EditText / allowReplace CheckBox，让用户可见地控制行为。
+   - 不可妥协边界（已写入代码 + 文档）：AI 链路不实例化 `FloatingInspector` / 不写 `InspectorViewModel`；节点引用一律是定位条件 `AiUiTarget` 由本地二次定位，禁止直接用 bounds 坐标点击；任务级授权 + App scope + 步数 / 时长 / 能力四条边界由 `AiAgentSession` 强制执行。
 
 3. **AI 行动计划与分级授权**
    - 范围：未来 `AiIntent`、`AiActionPlan`、`AiRiskAssessment`、`AiPermissionPolicy`、`AiDecisionRecord`。

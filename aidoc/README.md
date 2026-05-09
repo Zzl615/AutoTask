@@ -5,6 +5,20 @@
 >
 > 如需给最终用户看的说明，请读根目录的 `README.md`；本目录偏重 **实现层细节**、**模块关系**、**扩展点** 和 **调试切入点**。
 
+## 开工前硬约束（**违反将造成架构债，不可越过**）
+
+任何涉及"读屏 / 执行 UI 动作 / 跨进程能力 / Service / Bridge / Task / AIDL"的改动，**开工前 100% 必读**：
+
+1. `02-architecture.md` §2「进程模型」+ §2.1「进程注解」
+2. `05-services-and-ipc.md` 全部
+3. `03-engine-applet-model.md`（如果要执行 / 序列化任务，必读）
+4. `09-development-guide.md`（特别是 §9 AI 警告 / §7 修改 AIDL 兼容策略）
+5. **grep `@Privileged` / `@Local` / `@Anywhere`**，确认你引用的每个方法在哪个进程能跑
+
+完成后**在 todo / PR 描述里加一条"已对照 aidoc 02 §2 + 05 + 09"**才能动键盘。
+
+历史案例：2026-05-09 给 AI agent 接屏幕感知能力时跳过这一步，直接在主进程调 `currentService.uiAutomatorBridge`，结果 Shizuku 模式触发 `ensurePrivilegedProcess()` 抛异常，整个 agent 链路对 Shizuku 用户根本不工作。复盘见 `16-ai-inspector-capability.md` §13.8。
+
 ## 使用指引（AI agent 快速上手）
 
 1. 先看 `01-overview.md` 明确项目身份与功能边界。

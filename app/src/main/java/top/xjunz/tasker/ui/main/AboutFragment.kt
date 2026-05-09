@@ -315,6 +315,56 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             text = R.string.ai_enable.text
             isChecked = Preferences.aiEnabled
         }
+        val agentCheckBox = CheckBox(context).apply {
+            text = R.string.ai_agent_enable.text
+            isChecked = Preferences.aiAgentEnabled
+        }
+        val agentDescView = TextView(context).apply {
+            text = R.string.ai_agent_enable_desc.text
+            alpha = .72f
+            setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodySmall)
+        }
+
+        // ---- Agent 决策面板配置（3 项）----
+        val confirmModeRawValues = listOf(
+            "auto_approve" to R.string.ai_agent_confirm_mode_auto_approve.text,
+            "wait_for_user" to R.string.ai_agent_confirm_mode_wait_for_user.text,
+            "disabled" to R.string.ai_agent_confirm_mode_disabled.text
+        )
+        val confirmModeNames = confirmModeRawValues.map { it.second }
+        val currentMode = Preferences.aiAgentConfirmMode ?: "auto_approve"
+        val currentModeIndex = confirmModeRawValues.indexOfFirst { it.first == currentMode }
+            .coerceAtLeast(0)
+        val confirmModeInput = MaterialAutoCompleteTextView(context).apply {
+            inputType = InputType.TYPE_NULL
+            setAdapter(
+                ArrayAdapter(
+                    context,
+                    android.R.layout.simple_spinner_dropdown_item,
+                    confirmModeNames
+                )
+            )
+            setText(confirmModeNames[currentModeIndex], false)
+            setOnClickListener { showDropDown() }
+            setOnFocusChangeListener { _, hasFocus -> if (hasFocus) post { showDropDown() } }
+        }
+        val confirmModeLayout = TextInputLayout(context).apply {
+            hint = R.string.ai_agent_confirm_mode.text
+            boxBackgroundMode = TextInputLayout.BOX_BACKGROUND_OUTLINE
+            endIconMode = TextInputLayout.END_ICON_DROPDOWN_MENU
+            addView(confirmModeInput)
+        }
+        val (confirmSecondsLayout, confirmSecondsInput) = newInputLayout(
+            R.string.ai_agent_confirm_seconds.text,
+            Preferences.aiAgentConfirmSeconds.toString(),
+            1,
+            inputType = InputType.TYPE_CLASS_NUMBER
+        )
+        val confirmAllowReplaceCheckBox = CheckBox(context).apply {
+            text = R.string.ai_agent_confirm_allow_replace.text
+            isChecked = Preferences.aiAgentConfirmAllowReplace
+        }
+
         val (baseUrlLayout, baseUrlInput) = newInputLayout(
             R.string.ai_provider_base_url.text,
             Preferences.aiProviderBaseUrl.orEmpty(),
@@ -360,16 +410,26 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             alpha = .72f
             setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodySmall)
         }
+        // 用变量持有 sectionTitle 引用，避免后面用脆弱的 getChildAt(index) 取
+        val basicSection = sectionTitle(R.string.ai_basic_settings, R.string.ai_basic_settings_desc)
+        val agentSection = sectionTitle(R.string.ai_agent_section, R.string.ai_agent_section_desc)
+        val advancedSection = sectionTitle(R.string.ai_advanced_settings, R.string.ai_advanced_settings_desc)
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24.dp, 4.dp, 24.dp, 16.dp)
             addView(captionView)
             addView(enableCheckBox)
-            addView(sectionTitle(R.string.ai_basic_settings, R.string.ai_basic_settings_desc))
+            addView(agentCheckBox)
+            addView(agentDescView)
+            addView(basicSection)
             addView(baseUrlLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(apiKeyLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(modelLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            addView(sectionTitle(R.string.ai_advanced_settings, R.string.ai_advanced_settings_desc))
+            addView(agentSection)
+            addView(confirmModeLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            addView(confirmSecondsLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            addView(confirmAllowReplaceCheckBox)
+            addView(advancedSection)
             addView(temperatureLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(maxTokensLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(timeoutLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -379,6 +439,8 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             baseUrlLayout,
             apiKeyLayout,
             modelLayout,
+            confirmModeLayout,
+            confirmSecondsLayout,
             temperatureLayout,
             maxTokensLayout,
             timeoutLayout,
@@ -387,10 +449,13 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             (it.layoutParams as? LinearLayout.LayoutParams)?.topMargin = marginTop
         }
         (enableCheckBox.layoutParams as? LinearLayout.LayoutParams)?.topMargin = 12.dp
-        container.getChildAt(2).let {
-            (it.layoutParams as? LinearLayout.LayoutParams)?.topMargin = 16.dp
+        (agentCheckBox.layoutParams as? LinearLayout.LayoutParams)?.topMargin = 8.dp
+        (agentDescView.layoutParams as? LinearLayout.LayoutParams)?.apply {
+            topMargin = 2.dp
+            leftMargin = 32.dp
         }
-        container.getChildAt(6).let {
+        (confirmAllowReplaceCheckBox.layoutParams as? LinearLayout.LayoutParams)?.topMargin = 8.dp
+        listOf(basicSection, agentSection, advancedSection).forEach {
             (it.layoutParams as? LinearLayout.LayoutParams)?.topMargin = 20.dp
         }
         val scrollView = ScrollView(context).apply {
@@ -415,8 +480,17 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
                 height = (resources.displayMetrics.heightPixels * 0.85f).toInt()
             }
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                // 把当前选中的模式 label 反查回 raw value（"auto_approve"/"wait_for_user"/"disabled"）
+                val selectedModeLabel = confirmModeInput.text?.toString().orEmpty()
+                val selectedModeRaw = confirmModeRawValues
+                    .firstOrNull { it.second == selectedModeLabel }?.first ?: "auto_approve"
                 if (!saveAiConfig(
                         enableCheckBox.isChecked,
+                        agentCheckBox.isChecked,
+                        selectedModeRaw,
+                        confirmSecondsInput,
+                        confirmSecondsLayout,
+                        confirmAllowReplaceCheckBox.isChecked,
                         baseUrlInput,
                         baseUrlLayout,
                         apiKeyInput,
@@ -444,6 +518,11 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
 
     private fun saveAiConfig(
         enabled: Boolean,
+        agentEnabled: Boolean,
+        agentConfirmModeRaw: String,
+        agentConfirmSecondsInput: TextInputEditText,
+        agentConfirmSecondsLayout: TextInputLayout,
+        agentConfirmAllowReplace: Boolean,
         baseUrlInput: TextInputEditText,
         baseUrlLayout: TextInputLayout,
         apiKeyInput: TextInputEditText,
@@ -498,8 +577,19 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             confidenceLayout.error = R.string.ai_error_confidence.text
             valid = false
         }
+        // 验证 agent 决策秒数（仅在 agent 启用且 mode != disabled 时强校验）
+        agentConfirmSecondsLayout.error = null
+        val agentConfirmSeconds = agentConfirmSecondsInput.text?.toString()?.trim()?.toIntOrNull()
+        if (agentConfirmSeconds == null || agentConfirmSeconds !in 1..60) {
+            agentConfirmSecondsLayout.error = R.string.ai_agent_confirm_seconds_error.text
+            valid = false
+        }
         if (!valid) return false
         Preferences.aiEnabled = enabled
+        Preferences.aiAgentEnabled = agentEnabled
+        Preferences.aiAgentConfirmMode = agentConfirmModeRaw
+        Preferences.aiAgentConfirmSeconds = agentConfirmSeconds!!
+        Preferences.aiAgentConfirmAllowReplace = agentConfirmAllowReplace
         Preferences.aiProviderBaseUrl = baseUrl.takeIf { it.isNotEmpty() }
         Preferences.aiProviderApiKey = apiKey.takeIf { it.isNotEmpty() }
         Preferences.aiProviderModel = model.takeIf { it.isNotEmpty() }
@@ -569,15 +659,23 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
             3
         )
 
+        // caption 不再走 dialog.setMessage，而是放到容器顶部，和 ScrollView 一起滚动；
+        // 否则横屏时 message 区会挤掉下方输入框和按钮。布局风格与 AI 配置弹窗保持一致。
+        val captionView = TextView(context).apply {
+            text = R.string.voice_recognition_config_caption.text
+            alpha = .72f
+            setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodySmall)
+        }
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 8.dp, 24.dp, 0)
+            setPadding(24.dp, 4.dp, 24.dp, 16.dp)
+            addView(captionView)
             addView(serviceLayout)
             addView(appKeyLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(accessKeyIdLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             addView(accessKeySecretLayout, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        listOf(appKeyLayout, accessKeyIdLayout, accessKeySecretLayout).forEach {
+        listOf(serviceLayout, appKeyLayout, accessKeyIdLayout, accessKeySecretLayout).forEach {
             (it.layoutParams as? LinearLayout.LayoutParams)?.topMargin = marginTop
         }
 
@@ -595,14 +693,28 @@ class AboutFragment : BaseFragment<FragmentAboutBinding>(), ScrollTarget,
         }
         updateAlibabaFields()
 
+        val scrollView = ScrollView(context).apply {
+            isFillViewport = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                container,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
         val dialog = MaterialAlertDialogBuilder(context)
             .setTitle(R.string.voice_recognition_config)
-            .setMessage(R.string.voice_recognition_config_caption)
-            .setView(container)
+            .setView(scrollView)
             .setNegativeButton(android.R.string.cancel, null)
             .setPositiveButton(android.R.string.ok, null)
             .create()
         dialog.setOnShowListener {
+            // 横屏时屏幕高度有限，用 85% 屏幕高度封顶，让 ScrollView 内部滚动而不是把按钮挤出去。
+            dialog.window?.attributes = dialog.window?.attributes?.apply {
+                height = (resources.displayMetrics.heightPixels * 0.85f).toInt()
+            }
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 if (!saveVoiceRecognitionConfig(
                         selectedService,

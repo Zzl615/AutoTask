@@ -348,3 +348,298 @@ RootFlow
 - 转换器要带单测：AI 输出的每个 capability → 对应 Applet 树形结构 + Registry id 与现有 `acceptAppletsFromAutoClick` 一致。
 - 任何新代码文件用 `Copyright (c) 2026 IanVzs. All rights reserved.`，包路径放 `top.xjunz.tasker.ai.inspector` / `top.xjunz.tasker.ai.draft`。
 - 文档同步：第二阶段任意一步落地都要回头更新 `14-ai-integration.md` §5 表格、`13-todo.md` 进度、本文件 §9 验收状态。
+
+## 13. 关键转向：从 Phase 2.A/B/C 三段式 → Agent Loop（2026-05-09 决策）
+
+### 13.1 触发原因
+
+Phase 2.A/B/C 把"读屏 / 点击 / 输入"分成三个阶段，每阶段都要走完一轮"开发 → 用户验证 → 再开发"。第一阶段验证完后用户判断：
+
+> **用户原话**：
+> "因为很多任务都是打开 app 然后才开始具体的任务内容 如果权限只有打开某 app 那么 AI 没有任何意义！不能操作控件 自动识别控件了解控件功能那么就无法完成用户诉求 这样的 AI 也是毫无意义！！！全部可以用规则取代 不对吗？"
+> "你好好考虑下如何将 AI 可以根据用户需求探索式的建立一个一步步可执行的 渐进式的 可以试错可以改正 可以探索的 建立可以完成任务的任务"
+> "开始做吧 放开手脚 先将 AI 从笼子里放出来 然后在后续我的使用中再去给他设定一些限制"
+
+判断成立：planner-only 模式（AI 一次性出几步 Applet 描述）做不到"看屏幕、再决定下一步"，那就只是规则的低配版。**真正的护城河必须是 agent loop**：循环里反复"读屏 → 决策 → 执行 → 看结果 → 再决策"。
+
+### 13.2 路线调整
+
+Phase 2.A 只读快照 + Phase 2.B 可执行节点 + Phase 2.C 写入兜底，**合并成一次性落地的 agent loop 闭环**。三个原阶段被新结构吸收：
+
+| 原 Phase | 现在的位置 |
+|---------|-----------|
+| 2.A 只读快照 | `ScreenSnapshotProvider` + `AiUiSnapshot` 已实现，第一时间被 `AiAgentSession` 使用 |
+| 2.B 可执行节点 | `AiAgentExecutor` + `AiUiTarget` 直接执行 click / set_text / scroll / launch / global，**不再分批** |
+| 2.C 写入与兜底 | set_text 默认开放；兜底容错下放给 agent loop 自身（AI 看到失败就调整下一步） |
+
+边界"四条铁律"也调整为更简的"任务级授权 + 步数 / 时长 / App scope"，不再做每步阻断式弹窗。
+
+### 13.3 实际落地（2026-05-09）
+
+新建文件（`app/src/main/java/top/xjunz/tasker/ai/agent/`）：
+
+- `AiUiSnapshot.kt`：节点压缩 DTO + `AiUiTarget` 定位条件
+- `ScreenSnapshotProvider.kt`：从 `A11yAutomatorService.rootInActiveWindow` + `StableNodeInfo.freeze()` 抓取并压缩快照
+- `AiAgentAction.kt`：`AiAgentActionDto` + `sealed class AiAgentAction` + `AiAgentStepResult/Record`
+- `AiAgentExecutor.kt`：用最新真实节点树二次定位 → `performAction(ACTION_CLICK / LONG_CLICK / SET_TEXT / SCROLL_FORWARD / SCROLL_BACKWARD)` / `performGlobalAction(BACK / HOME)` / `startActivity(Intent)`
+- `AiAgentPlanner.kt`：两段 prompt —— `planSession` 出会话规划、`nextAction` 出每步动作（携带 history + snapshot）
+- `AiAgentSession.kt`：循环 `读屏 → askAi → execute → 反馈 → 边界检查`；7 种 outcome（Completed / GivenUp / LimitExceeded / OutOfScope / PermissionDenied / AiError / Cancelled）
+- `AiTaskScope.kt`：任务级授权数据结构 + `AiTaskScopeStore`（in-memory，session 级）
+
+接入：
+
+- `Preferences` 新增 `aiAgentEnabled`（默认 **true**，符合用户"先放开"要求）+ `aiAgentMaxSteps` (30) + `aiAgentMaxSeconds` (90)
+- `VoiceCommandService.runAiInterpretation` 在 `CreateTaskDraft` 分支检测 `aiAgentEnabled`，启动 `runAgentFlow(text)`：
+  1. 调 `AiAgentPlanner.planSession`
+  2. 暴露 `pendingAgent: AgentRequestPayload` 给 UI 等用户授权
+  3. `CompletableDeferred` 等用户决策（60s 超时算拒绝）
+  4. 用户允许 → 写 `AiTaskScope` 进 store → `AiAgentSession.run()` 跑
+  5. 每步通过 `Callbacks.onStep` 回调追加到 records
+  6. outcome 写一条总结记录
+- `VoiceCommandFragment` 监听 `pendingAgent` 弹任务级授权 `MaterialAlertDialog`（列出目标 / App / 边界 / 能力，"允许这次 / 拒绝"）
+- `AboutFragment` 的 AI 配置弹窗加 "启用 AI agent 模式" 复选框 + 解释段
+- 新增 25+ 条 strings 描述会话生命周期（planning / planned / denied / started / step / completed / given_up / limit / out_of_scope / permission_denied / ai_error / cancelled）
+
+### 13.4 边界设计（仅四条，不阻塞执行）
+
+1. **任务级授权**：每个新会话弹一次对话框列出"目标 / App / 步数 / 时长 / 能力"，一键允许整段会话；session 内不再有任何打断。
+2. **App scope 锁**：`AiAgentSession` 每步抓快照后检查当前包名是否在 `scope.targetApps` 内；切到非授权 App 立即停止并报告 `OutOfScope`。`launcher / systemui / android` 等过场包名豁免。
+3. **步数 / 时长上限**：默认 30 步 / 90 秒，到顶即停。
+4. **未授权能力即停**：每步执行前检查 `action.requiredCapability()` 是否在 `scope.capabilities` 内；不在则 `PermissionDenied`，不静默跳过。
+
+### 13.5 已知 follow-up（不阻塞验证）
+
+- 当前 `AiAgentSession` 不会把每步同时沉淀成 XTask 草稿——结束后**没有**自动"保存为可重放任务"按钮。等用户看完几次实际跑的效果再决定保存格式。
+- 节点压缩规则比较粗暴（`MAX_NODES = 80`、`MAX_TEXT_LEN = 80`），没做按 App 类别差异化；密码 / 银行卡 / CVV 等敏感字段也尚未做白名单 redact，仅依赖 `give_up` 行为指南让 AI 自己回避。
+- Plan 阶段 `targetAppPackage` 完全信任 AI；如果 AI 给了错的包名，scope 检查后续会拦下来，但用户体验是"开了一次会话，第一步就 OutOfScope"。下一轮可以加"`PackageManagerBridge` 校验包名实际存在 + 弹窗里允许用户改"。
+- 没做"取消运行中 session"的 UI；用户当前只能停掉语音监听服务来强制中断（`scope.cancel()` 会让 `coroutineScope` 抛出 CancellationException → 走到 `AiError` 分支）。下一轮加一个"中止 agent"按钮。
+
+### 13.8 架构对齐：用现有 Applet 管道执行 agent（2026-05-09 第三次补强 / KISS 重构）
+
+**这一节是承担"我之前犯的架构错"的复盘 + 修复方案。请后续做 AI / 自动化相关功能的 agent 必读。**
+
+#### 复盘：之前为什么走偏了
+
+`aidoc/09-development-guide.md §9 「新增 AI 能力」` 里其实写得清清楚楚：
+
+> AI 功能先作为现有任务系统的上层协作者，**不直接绕过 `XTask` / `Applet` / `AutomatorService`**。
+
+我无视了这条警告。前几轮我把 `AiAgentExecutor` 写成"主进程直接调 `A11yAutomatorService.rootInActiveWindow` + `node.performAction(...)`"，造成两个根本错误：
+
+1. **进程模型违反**：a11y service 跑在主进程，Shizuku service 跑在 :service 特权进程。我的代码在主进程访问 `currentService.uiAutomatorBridge` 在 Shizuku 模式下会触发 `ensurePrivilegedProcess()` 抛 `IllegalStateException`，这就是用户实测"啥也检测不到"的根因。
+2. **与现有 Applet 体系并行**：AutoTask 已经有一套完整的"`UiObjectFlowRegistry.containsUiObject` + `UiObjectCriterionRegistry` + `UiObjectActionRegistry` + `scheduleOneshotTask` 派进特权进程跑"管道，被 inspector / 任务执行使用。我无视它，自己发明 `AiUiTarget` + `matchesNode` + `performNodeAction` 第二套体系，违反 DRY。
+
+**根因**：开工前没读 `aidoc/02 §2 进程模型`、`aidoc/05 §2 两种实现`、`aidoc/09 §9 AI 警告`，凭"看见 inspector 用什么就抄什么"做决定。
+
+**今后硬约束**：碰任何"读屏 / 执行 UI 动作 / 跨进程"的代码，**开工前必读** `aidoc/02 §2`、`aidoc/05`、`aidoc/03`、`aidoc/09`，并在 PR / todo 里加一条"已对照 aidoc"。这条写进 `aidoc/README.md` 顶部 + `aidoc/13-todo.md`。
+
+#### 新方案：方案 K（KISS，复用现有任务管道）
+
+**核心想法**：agent 每一步 AI 输出的动作，**翻译成一个最小的临时单步 `XTask`**，通过现有的 `currentService.scheduleOneshotTask(task, callback)` 派进特权进程跑。复用项目原本就有的所有能力。
+
+```
+┌─ 主进程 ────────────────────────────────┐    ┌─ :service / a11y service ─┐
+│                                          │    │                           │
+│  AiAgentSession.run() 循环              │    │  PrivilegedTaskManager    │
+│   ① 抓屏 (走 AIDL)                      │    │   或 LocalTaskManager     │
+│   ② AI 决策 (LLM)                       │    │   ↓                       │
+│   ③ 决策面板 (用户介入)                 │    │   现有 Applet 管道执行    │
+│   ④ AiActionToTask.translate(action)   │    │   - containsUiObject       │
+│      → 临时单步 XTask                   │    │   - withId / textEquals    │
+│   ⑤ scheduleOneshotTask(task, cb)─────────→│   - click / setText / ...  │
+│   ⑥ ← callback ok/fail ───────────────────│   - launchApp / suspension │
+│   ⑦ history += step                     │    │                           │
+└──────────────────────────────────────────┘    └───────────────────────────┘
+```
+
+#### `AiAgentAction` ↔ 现有 Registry 映射表
+
+每条 AI 动作翻译成**一棵最小 XTask 树**：`RootFlow → Do → (containsUiObject → Criterion + Action)`，或 `RootFlow → Do → 单 Action`。
+
+| AiAgentAction | 翻译目标 |
+|---|---|
+| `LaunchApp(pkg)` | `RootFlow → Do → ApplicationActionRegistry.launchApp(pkg)` |
+| `Click(target)` | `RootFlow → Do → UiObjectFlowRegistry.containsUiObject{ Criterion(target) ; UiObjectActionRegistry.click }` |
+| `LongClick(target)` | 同上，最后 action 换 `longClick` |
+| `SetText(target, text)` | 同上，最后 action 换 `setText` 带文本参数 |
+| `Scroll(target?, direction)` | 若 target 非空：`containsUiObject` 包；direction → `UiObjectActionRegistry.scrollForward/Backward`；target null 时找当前 scrollable 容器（暂用 `forEachUiScrollable` 或最简：先要求 target） |
+| `Wait(seconds)` | `RootFlow → Do → ControlActionRegistry.suspension(seconds)` |
+| `GlobalBack` | `RootFlow → Do → GlobalActionRegistry.pressBack` |
+| `GlobalHome` | `RootFlow → Do → GlobalActionRegistry.pressHome` |
+| `Done` / `GiveUp` / `Unknown` | session 终止，**不翻译为 task**，直接走 outcome |
+
+`AiUiTarget` 翻译为 Criterion：
+- `viewId` → `UiObjectCriterionRegistry.withId.yieldWithFirstValue(viewId)`
+- `textEquals` → `textEquals.yieldWithFirstValue(text)`
+- `textContains` → `textContains.yieldWithFirstValue(text)`
+- `contentDescEquals` → `contentDesc.yieldWithFirstValue(desc)`
+- `contentDescContains` → `contentDesc` 的 contains 变体（看 Registry 实际可用方法）
+- `className` → `isType.yieldWithFirstValue(className)`
+
+多字段 AND 关系靠 `containsUiObject` 内多 Criterion + 默认 `REL_AND`。
+
+#### 新模块 `ai/translator/AiActionToTask`（新增）
+
+```kotlin
+object AiActionToTask {
+    /**
+     * 把一个 AiAgentAction 翻译成一棵最小 XTask 树。
+     * 返回的 XTask 已经设置好 metadata.checksum，可以直接 LocalTaskManager.addOneshotTaskIfAbsent + scheduleOneshotTask。
+     * Done/GiveUp/Unknown/Wait 之外的所有 action 都翻译成 RootFlow → Do → ... 结构。
+     * Done/GiveUp/Unknown 调用方应该自己处理（不调 translate）。
+     */
+    fun translate(action: AiAgentAction): XTask?
+}
+```
+
+- 内部用 `AppletOptionFactory.uiObjectFlowRegistry.containsUiObject.yield()` / `uiObjectRegistry.withId.yieldWithFirstValue(...)` 等 DSL 直接拼。
+- 复用 `task/inspector/shared/NodeToActionAssembler.wrapAsContainsUiObject(...)` 包 containsUiObject。
+- 引用编辑：`AppletReferenceEditor` 设 reference / referent，让 Action 能拿到 `containsUiObject` 命中节点。
+- `metadata.title = "AI Step #${stepIndex}: ${action.kind}"`，`taskType = TYPE_ONESHOT`，`checksum = 内容 MD5`。
+
+#### AIDL 变更（仅 1 个新方法，末尾追加保兼容）
+
+`app/src/main/aidl/top/xjunz/tasker/service/IRemoteAutomatorService.aidl`：
+
+```aidl
+// 新增：让主进程拿到当前屏幕节点树压缩 JSON。
+// 在特权进程里调本地 uiAutomation.rootInActiveWindow + StableNodeInfo.freeze + AiNodeTreeCompactor。
+// 返回 JSON（AiUiSnapshot 序列化），主进程反序列化即用。
+String captureUiSnapshotJson(int maxNodes, int maxTextLen) = 17;
+```
+
+按 `aidoc/05` 的兼容策略，**末尾追加**而非修改签名，老服务 / 老客户端互相兼容（旧服务调用此方法会返回默认/空，新客户端能 graceful degrade）。
+
+#### A11y 模式怎么办
+
+A11y 模式下 `currentService` 不是 `ShizukuAutomatorService.Stub` 而是 `A11yAutomatorService` 自己（同一进程），`AutomatorService` interface 默认方法行为不需要 AIDL。
+
+**最小代价**做法：在 `AutomatorService` interface 上加一个**默认方法** `captureUiSnapshotJson(maxNodes, maxTextLen): String`，A11y 实现里直接调 `rootInActiveWindow + freeze + AiNodeTreeCompactor`；ShizukuAutomatorService 实现里走 IRemoteAutomatorService AIDL（特权进程内仍然是同样实现）。这样主进程统一调 `currentService.captureUiSnapshotJson(...)`，分发由 `currentService` 自动处理。
+
+#### 删除清单
+
+- `app/src/main/java/top/xjunz/tasker/ai/agent/AiAgentExecutor.kt` 大幅瘦身：
+  - 删 `performNodeAction` / `performClick` / `performLongClick` / `performSetText` / `performScroll` / `performGlobal` 整个执行链
+  - 删 `matchesNode` / `findFirstScrollable` / `summarize` / `currentForegroundPackage` / `traverseAndCollect`（如还有）
+  - 仅保留 `execute(action)` 入口，内部一律走 `AiActionToTask.translate(action)` → `LocalTaskManager.addOneshotTaskIfAbsent(task)` → `currentService.scheduleOneshotTask(task, callback)` → `await callback`
+- `app/src/main/java/top/xjunz/tasker/task/inspector/shared/UiTreeQuery.kt` 大幅瘦身：
+  - 删 `rawRoot` / `findNodes` / `findStableNodes`
+  - 仅保留 `captureFrozenRoot()` 但内部改成调 `currentService.captureUiSnapshotJson(...)` 反序列化（或这个能力直接挪到 `ScreenSnapshotProvider` 内部，删 `UiTreeQuery.captureFrozenRoot`）
+- `app/src/main/java/top/xjunz/tasker/ai/agent/ScreenSnapshotProvider.kt` 大幅瘦身：
+  - 删 `compactNode` / `toAiUiNode`（这套逻辑搬到执行端进程作为 `AiNodeTreeCompactor`）
+  - `capture()` 改成"调 `currentService.captureUiSnapshotJson(...)` → `AiJson.decodeFromString<AiUiSnapshot>(json)`"
+- 新建 `app/src/main/java/top/xjunz/tasker/ai/snapshot/AiNodeTreeCompactor.kt`（执行端用，`AiUiSnapshot.kt` 维持 `ai.agent` 包不动作为跨进程 DTO）
+
+#### 实施顺序
+
+1. AIDL 加方法（aidoc/05 §7 兼容策略）
+2. `AutomatorService` interface 加默认方法
+3. `ShizukuAutomatorService` / `A11yAutomatorService` 各自实现（共用一套压缩逻辑）
+4. 主进程 `ScreenSnapshotProvider` 改走 RPC
+5. 新建 `AiActionToTask`
+6. 重写 `AiAgentExecutor` 走 `scheduleOneshotTask`
+7. 清理删除列表里的代码
+8. `make debug` 编译验证 + Shizuku 模式实测
+
+### 13.7 公共能力抽取与决策面板（2026-05-09 第二次补强）
+
+继续解决"AI 与悬浮助手没真正打通"的根本问题，本轮一次性把 A→B 两条线一起落地：
+
+#### A. 公共能力抽取（`task/inspector/shared/`）
+
+把"节点级"的纯 data 操作集中到一处，让 inspector 和 agent 走同一份代码：
+
+| 新建文件 | 职责 | 谁会调用 |
+|---|---|---|
+| `UiTreeQuery.kt` | 抓 root + freeze + DFS 查找 | `ScreenSnapshotProvider`（已迁）/ `AiAgentExecutor`（已迁）/ 未来 inspector 自身可迁 |
+| `NodeCriteriaExtractor.kt` | 节点 → Criterion Applet 候选（从 `NodeInfoOverlay.collectProperties` 抽，**语义和顺序严格对齐**） | `NodeInfoOverlay.collectProperties`（已迁）/ 未来 agent "保存为任务" |
+| `NodeToActionAssembler.kt` | Criterion 候选 → `containsUiObject` Flow（从 `acceptAppletsFromAutoClick` 抽 wrap 部分） | `AppletSelectorViewModel.acceptAppletsFromAutoClick`（已迁）/ 未来 agent "保存为任务" |
+| `AiUiTargetExtractor.kt` | 真节点 → `AiUiTarget`（"换一个"反向通道） | `CandidateListPicker`（V1）/ 未来 V2 inspector 接管 |
+
+调用方迁移后，**inspector 现有"用户手选节点 → Criterion / 自动点击"行为不变**，只是底层走公共代码。
+
+#### B. Agent 决策面板（`ai/agent/overlay/`）
+
+每步 agent action 在执行前都通过悬浮窗征询用户：**同意 / 拒绝 / 换一个**，倒计时到默认同意。
+
+| 新建文件 | 职责 |
+|---|---|
+| `AiAgentDecision.kt` | 决策结果 sealed interface：`ApprovedManual` / `ApprovedAuto` / `Rejected(source)` / `Replaced(newTarget)` / `Skipped`；`AiAgentConfirmMode` 枚举 4 种偏好 |
+| `AiAgentNodePicker.kt` | "换一个"抽象接口 + `CandidateListPicker`（V1，从快照按相似度排序前 5 候选）+ `InspectorPickerStub`（V2 占位，未来调起 FloatingInspector 让用户直接点屏） |
+| `AiAgentOverlayController.kt` | WindowManager 生命周期 + 程序化构造的决策卡片（标题 / 动作 / 思考 / 倒计时 ProgressBar / 3 个按钮 / 候选列表展开）+ 节点高亮（半透明红框 1s 淡出）|
+
+接入：
+
+- `AiAgentSession` 构造函数加 `overlay: AiAgentOverlayController?` + `picker: AiAgentNodePicker`；每步 nextAction 后 capability 校验通过、execute 之前 await `overlay.requestDecision`。
+- 决策结果直接影响 execute：`Replaced` 把 action.target 换成新 target 再执行；`Rejected` 写一条 FAIL 反馈记录跳过；其他直接执行。
+- `AiAgentStepRecord` 加 `userIntervention: AiAgentDecision?` 字段，写入 history。
+- `AiAgentPlanner.buildHistorySection` 把 `[用户同意]` / `[用户拒绝(原因)]` / `[用户换为...]` 标签塞进 prompt 喂给 AI，实现**自我学习**；尾部加一行 `（累计：用户拒绝 X 步，用户换节点 Y 步——请反思你的选择是否经常偏离用户意图）` 做行为引导。
+- `Preferences` 加 `aiAgentConfirmMode` (默认 `auto_approve`) / `aiAgentConfirmSeconds` (3) / `aiAgentConfirmAllowReplace` (true)。
+- `VoiceCommandService.runAgentFlow` session 创建时实例化 overlay，结束时 dismiss。
+
+#### V1 → V2 过渡空间
+
+- `AiAgentNodePicker` 接口设计的最大价值：V2 把 `CandidateListPicker` 换成 `FloatingInspectorPicker` 时，**决策面板 UI / `AiAgentDecision` / session 集成全都不动**，只换实现类。
+- V2 实现要点（写在 `InspectorPickerStub` 注释里）：弹起 `FloatingInspector(mode=UI_OBJECT)` → 监听 `EVENT_NODE_INFO_SELECTED` → `AiUiTargetExtractor.extract` → resume Continuation 返回 target。
+
+#### B3 配置 UI 推到下一轮
+
+`Preferences.aiAgentConfirmMode/Seconds/AllowReplace` 已有默认值，绝大多数用户用默认配置即可。完整 "AI agent 决策" 子页面 UI（弹窗 spinner / 滑杆 / checkbox 三件套）排到下一轮做。
+
+#### 不可妥协边界（写在代码与文档）
+
+- 公共能力的方法**必须**纯 data，不依赖 UI / ViewModel / LiveData / a11y service 状态。
+- AI agent 链路调"换一个"反向通道时，必须经过 `AiUiTargetExtractor`，禁止自己手写"节点 → AiUiTarget"。
+- 决策面板 overlay 的视图全部程序化构造，不引入 XML / databinding，便于未来微调。
+- overlay 必须优雅降级：用户没授 SYSTEM_ALERT_WINDOW 时所有 overlay 操作 noop，agent 仍可自动跑（等同 `Disabled` 模式）。
+
+### 13.6 plan 自检机制（2026-05-09 补强）
+
+第二阶段 backend 闭环跑通后立刻补上的关键能力：让 AI 在 agent loop 里**对照原 plan 自检"我有没有偏轨"**，并把这个评分喂回上层用于审计、未来可触发"主动询问用户"等扩展。
+
+#### 触发原因
+
+> **用户原话**：
+> "AI 可以在每一步获取到页面的可点击控件和输入框这些信息 对自己的草稿规划进行纠正吗？"
+
+诊断后明确：每步抓屏 + history 反馈早已具备，AI 已经能根据屏幕实情纠正下一步动作；但**初始 plan 在进入 loop 后被丢弃**，AI 没法对照原 plan 显式自评，导致：
+
+- 中等复杂任务里偶尔兜圈（连续点错却不知道自己已经偏离）。
+- 用户审计时只能看动作流水，看不出"AI 是否还在原方向上"。
+
+#### 设计
+
+1. **`AiAgentActionDto` 加 `plan_status` 字段**（`SerialName("plan_status")`），AI 必须每步返回 `on_track / adjusted / off_track / unknown` 之一，`AiAgentAction` 各 sealed 分支同步加 `planStatus` 字段透传。
+2. **`AiAgentPlanStatus` 枚举 + `parse(raw)`**：把 AI 返回字符串归一化（兼容 `on-track` / `ontrack` / 大小写），无法识别即 `Unknown`。
+3. **`AiAgentPlanner.nextAction` 新签名**接收 `plan: AiAgentSessionPlan?`；prompt 增加 `buildPlanSection`，向 AI 明示：
+   - 原计划摘要 + 估计步数 + 已用步数 + 上限
+   - 必须每步填 `plan_status`，行为准则里加上"连续两步 off_track 且看不到回轨迹象就 give_up"
+4. **`buildHistorySection` 把每步的 plan_status 一起喂回去**：AI 回看时能看到自己之前怎么自评，便于跨轮一致性。
+5. **`AiAgentSession` 构造函数新增 `plan: AiAgentSessionPlan?` 字段**，每轮调 `nextAction` 时透传；`VoiceCommandService.runAgentFlow` 把 `planResult.plan` 传进去。
+6. **`VoiceCommandService` UI 反馈**：
+   - 步骤标题前缀显示 `[在轨]/[微调]/[偏轨]/[未自评]` 标签
+   - `off_track` 步骤即使 OK 也用 `FAILURE` 颜色（红条），便于审计一眼挑出
+   - outcome 总结附加一行 `实际 N 步 / 估计 M 步 · 在轨 A · 微调 B · 偏轨 C · 未自评 D` 统计
+
+#### 现在的链路
+
+```
+用户："帮我在 X 里 Y"
+    ↓
+planSession → plan(targetApp, summary, estimated_steps, capabilities)
+    ↓
+任务级授权对话框 → 用户允许
+    ↓
+AiAgentSession(scope, plan, ...) 循环：
+    1. ScreenSnapshotProvider.capture()
+    2. AiAgentPlanner.nextAction(userGoal, history, snapshot, plan, maxSteps)
+       prompt 包含：原 plan + history(含历史 plan_status) + 当前屏幕节点
+    3. AI 输出 action（含 plan_status 自评）
+    4. AiAgentExecutor.execute(action)
+    5. record(plan_status)，UI 显示 [在轨]/[微调]/[偏轨]
+    6. 边界检查 + 终止判定
+    ↓
+outcome：附带"实际 N 步 / 估计 M 步 · 在轨/微调/偏轨/未自评"统计
+```
+
+这一改动对 token 消耗的影响：plan section 大约 50-100 tokens，每步多一个 plan_status 字段约 5-10 tokens；总体增长在 5% 以内，但换来了"AI 自我导航"的关键能力。

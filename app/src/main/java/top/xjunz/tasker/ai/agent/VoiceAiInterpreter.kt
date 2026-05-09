@@ -126,9 +126,12 @@ object VoiceAiInterpreter {
     private fun VoiceAiInterpretationDto.toCreateTaskDraft(
         confidence: Float
     ): VoiceAiInterpretation.CreateTaskDraft? {
-        val title = draftTitle?.trim().orEmpty()
+        // title 缺失时退化用 summary 顶上——AI 偶尔只填 summary 不填 draft_title。
+        // steps 允许为空：agent 模式会接管完整规划，VoiceAiInterpreter 只负责"分类+目标 App 提示"。
+        val title = (draftTitle?.trim()?.takeIf { it.isNotEmpty() }
+            ?: summary?.trim()?.takeIf { it.isNotEmpty() })
+            ?: return null
         val parsedSteps = parseDraftSteps(draftSteps)
-        if (title.isEmpty() || parsedSteps.isEmpty()) return null
         return VoiceAiInterpretation.CreateTaskDraft(
             title = title,
             summary = summary?.trim().orEmpty(),
@@ -178,13 +181,15 @@ object VoiceAiInterpreter {
 
     private fun buildPrompt(text: String, knownTaskTitles: List<String>): String {
         return """
-            你是 Android 自动化应用「AutoTask」的自然语言意图解析器。
-            请分析用户输入，并严格输出 JSON（不要 markdown、不要解释）。
+            你是 Android 自动化应用「AutoTask」的**意图分类器**。
+            分析用户输入，归类到下面三种 intent 之一，严格输出 JSON（不要 markdown、不要解释）。
 
             支持的 intent：
-            - RunExistingTask：用户希望立即执行一个已有任务，需要给出 query 字段（任务名或搜索关键词）。
-            - CreateTaskDraft：用户描述了一个新任务的需求，需要给出 draft_title（任务标题）和 draft_steps（步骤数组）。
-            - Unknown：无法判断或与自动化无关。
+            - RunExistingTask：用户描述明显指向"用户当前已保存的任务"清单中某一项（同义、缩写、漏字也算）。
+            - CreateTaskDraft：用户描述了一个**需要在某个 App 内完成的目标**（聊天、搜索、购物、订单、导航、签到、发消息、问问题、看视频…），
+              即使你不确定具体每一步该怎么操作 —— **只要能从用户描述里识别出"目标 App + 大致目的"就算**。
+              下游 agent 模式会接管完成具体的 click/输入/滑动操作，**你不需要详细规划**。
+            - Unknown：用户输入跟手机操作完全无关（纯闲聊、问哲学问题、要求你回答而不是操作手机），才用 Unknown。
 
             ${buildKnownTaskSection(knownTaskTitles, text)}
 
@@ -194,9 +199,9 @@ object VoiceAiInterpreter {
             {
               "intent": "RunExistingTask|CreateTaskDraft|Unknown",
               "query": "<任务名搜索词，仅 RunExistingTask 必填>",
-              "draft_title": "<新任务标题>",
+              "draft_title": "<新任务标题，CreateTaskDraft 必填，简洁概括目标>",
               "draft_steps": [
-                { "id": "<上面能力清单里的 id>", "params": { ... }, "description": "<人话说明这一步>" }
+                { "id": "<能力 id>", "params": { ... }, "description": "<人话>" }
               ],
               "confidence": 0.0,
               "summary": "<一句话中文解释你的判断>"
@@ -204,12 +209,15 @@ object VoiceAiInterpreter {
 
             约束：
             - 选择 intent 时**优先**判断是否能对应"用户当前已保存的任务"。
-              如果用户描述明显指向清单中某个任务（包括同义、缩写、漏字等），必须返回 RunExistingTask，
-              且 query **必须严格等于**该任务的原始标题（保持空格、标点、大小写完全一致），不要发挥也不要简写。
+              如果用户描述明显指向清单中某个任务，必须返回 RunExistingTask，
+              且 query **必须严格等于**该任务的原始标题（保持空格、标点、大小写完全一致），不要发挥。
             - 只有清单里确实没有合适项时，才使用 CreateTaskDraft 生成新任务草稿。
-            - draft_steps 数组里**优先**使用上面能力清单里的 id；params 必须按对应能力的字段名填写。
-            - 如果某一步没有合适的能力，可以用纯字符串描述这一步，App 端会标记为"暂无对应能力"。
-            - draft_steps 控制在 3-6 步，每步 description 用一句简洁中文。
+            - **关于 draft_steps（重要）**：
+              · 上面 capability 清单只是少量"已知精准能力"——**完整的 click / set_text / scroll 等所有 UI 操作由 agent 模式接管**，你不需要在 draft_steps 里枚举它们。
+              · 推荐做法：draft_steps 只放 1 步 launch_app（如果识别得出包名/App 名），description 写"打开 X 后由 agent 接管完成：<目标>"。
+              · 实在识别不出 App 名也没关系——给个**空数组** `"draft_steps": []` 也合法，agent 会从用户原始 goal 自己规划目标 App。
+              · **绝对不要因为"我不知道每一步该点什么"就判 Unknown**——只要能识别"用户想在某 App 里做某件事"，统统判 CreateTaskDraft。
+            - confidence 范围 0.0-1.0：能识别出目标 App + 目的 → 0.7+；只能识别目的不知道 App → 0.6+；纯闲聊 → 用 Unknown 而不是低 confidence。
 
             用户输入：
             $text

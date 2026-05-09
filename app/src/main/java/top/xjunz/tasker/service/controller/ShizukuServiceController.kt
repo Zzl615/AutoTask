@@ -143,9 +143,7 @@ abstract class ShizukuServiceController<S : Any> : ServiceController<S>() {
 
     override fun stopService() {
         cancelInvalidBinderRetry()
-        Shizuku.unbindUserService(
-            userServiceStandaloneProcessArgs, userServiceConnection, true
-        )
+        safeUnbindUserService(remove = true)
         serviceInterface = null
     }
 
@@ -160,8 +158,33 @@ abstract class ShizukuServiceController<S : Any> : ServiceController<S>() {
     override fun unbindService() {
         cancelInvalidBinderRetry()
         removeStateListener()
-        serviceInterface?.asBinder()?.unlinkToDeath(deathRecipient, 0)
-        Shizuku.unbindUserService(userServiceStandaloneProcessArgs, userServiceConnection, false)
+        // unlinkToDeath 在 deathRecipient 没注册过时会抛 NoSuchElementException，
+        // Activity 重建（横屏 / 主题切换）时很容易碰到 → 用 runCatching 吞掉。
+        runCatching {
+            serviceInterface?.asBinder()?.unlinkToDeath(deathRecipient, 0)
+        }
+        safeUnbindUserService(remove = false)
+    }
+
+    /**
+     * 包一层 [Shizuku.unbindUserService]，避免 Shizuku binder 还没建立 / 已断开 / 远程进程已死时
+     * 抛 `IllegalStateException("binder haven't been received")` 一路冒泡到 Activity 销毁路径，
+     * 让 App 在横屏 / 系统主题切换 / 任何 Activity 重建时直接 crash。
+     *
+     * 这里**不**用 [ShizukuUtil.isShizukuAvailable]：那个 getter 会顺带检查权限，太严；本场景只需要
+     * binder 还活着即可——不活也不能强行 unbind，跳过即可。
+     */
+    private fun safeUnbindUserService(remove: Boolean) {
+        if (!Shizuku.pingBinder()) {
+            // Shizuku 远程进程不在 / 从未连接，没有可解绑的 user service。
+            return
+        }
+        runCatching {
+            Shizuku.unbindUserService(userServiceStandaloneProcessArgs, userServiceConnection, remove)
+        }.onFailure { error ->
+            // 中途 binder 死掉、UserService 已经被外部杀掉、版本不匹配等场景，吞掉避免影响 onDestroy。
+            Log.w(tag, "Shizuku.unbindUserService failed but ignored", error)
+        }
     }
 
     override val isServiceRunning: Boolean

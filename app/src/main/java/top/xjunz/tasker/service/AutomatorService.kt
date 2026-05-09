@@ -51,6 +51,17 @@ interface AutomatorService {
         return a11yEventDispatcher.getCurrentComponentInfo()
     }
 
+    /**
+     * 把当前焦点窗口的节点树压缩成 [top.xjunz.tasker.ai.agent.AiUiSnapshot] 的 JSON 字符串。
+     *
+     * 抽象方法：A11y 模式（service 在主进程）走本地实现；Shizuku 模式（service 在特权进程）走 AIDL 远程。
+     * 两边都用 [top.xjunz.tasker.task.inspector.shared.AiNodeTreeCompactor] 做压缩，保证 schema 一致。
+     *
+     * 这是 AI agent 在跨进程模式下"看见屏幕"的唯一新增 IPC 契约。返回空字符串表示"当前抓不到 root"
+     * （a11y 未连 / 远端断开 / 窗口切换瞬间），调用方应等下一轮重试。
+     */
+    fun captureUiSnapshotJson(maxNodes: Int, maxTextLen: Int): String
+
     fun scheduleOneshotTask(task: XTask, onCompletion: ITaskCompletionCallback)
 
     fun stopOneshotTask(task: XTask)

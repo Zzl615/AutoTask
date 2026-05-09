@@ -25,10 +25,23 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import top.xjunz.tasker.Preferences
 import top.xjunz.tasker.R
 import top.xjunz.tasker.ai.AiCenter
+import top.xjunz.tasker.ai.agent.AiAgentAction
+import top.xjunz.tasker.ai.agent.AiAgentLog
+import top.xjunz.tasker.ai.agent.AiAgentPlanner
+import top.xjunz.tasker.ai.agent.AiAgentSession
+import top.xjunz.tasker.ai.agent.AiAgentSessionOutcome
+import top.xjunz.tasker.ai.agent.AiAgentSessionPlan
+import top.xjunz.tasker.ai.agent.AiAgentStepRecord
 import top.xjunz.tasker.ai.agent.AiDraftStep
+import top.xjunz.tasker.ai.agent.AiTaskScope
+import top.xjunz.tasker.ai.agent.AiTaskScopeStore
+import top.xjunz.tasker.ai.agent.overlay.AiAgentOverlayController
+import top.xjunz.tasker.ai.agent.overlay.InspectorPickerStub
 import top.xjunz.tasker.ai.agent.VoiceAiInterpretation
 import top.xjunz.tasker.ai.agent.VoiceAiInterpreter
 import top.xjunz.tasker.ai.audit.AiDecisionRecord
@@ -94,7 +107,14 @@ data class VoiceCommandUiState(
     val latestTaskTitle: String? = null,
     val latestResult: VoiceCommandRecordResult? = null,
     val records: List<VoiceCommandRecord> = emptyList(),
-    val pendingDraft: VoiceCommandDraftPayload? = null
+    val pendingDraft: VoiceCommandDraftPayload? = null,
+    /**
+     * AI agent 会话开始前等待用户授权的请求。Fragment 监听到非空值后弹出"任务级授权"对话框，
+     * 通过 [VoiceCommandService.grantAgent]/[VoiceCommandService.denyAgent] 决策。
+     */
+    val pendingAgent: AgentRequestPayload? = null,
+    /** 当前正在运行的 agent 会话标识，便于 UI 显示"AI 正在执行 #N 步"等状态。null 表示空闲。 */
+    val activeAgentSessionId: String? = null
 )
 
 /**
@@ -106,6 +126,18 @@ data class VoiceCommandDraftPayload(
     val summary: String,
     val steps: List<AiDraftStep>,
     val confidence: Float
+)
+
+/**
+ * 一次 AI agent 会话开始前需要用户确认的请求。会被 [VoiceCommandUiState.pendingAgent] 暴露给 UI。
+ */
+data class AgentRequestPayload(
+    val sessionId: String,
+    val userGoal: String,
+    val plan: AiAgentSessionPlan,
+    val targetApps: Set<String>,
+    val maxSteps: Int,
+    val maxSeconds: Int
 )
 
 class VoiceCommandService : Service(), RecognitionListener {
@@ -134,6 +166,30 @@ class VoiceCommandService : Service(), RecognitionListener {
             val draft = current.pendingDraft ?: return
             if (draft.id != draftId) return
             uiState.postValue(current.copy(pendingDraft = null))
+        }
+
+        /**
+         * 等待用户对 [AgentRequestPayload] 决策的 deferred 集合。Fragment 通过
+         * [grantAgent]/[denyAgent] 完成它，service 内部 [runAgentFlow] 在 await。
+         */
+        private val pendingAgentDecisions = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+
+        /** 用户在任务级授权对话框点"允许"。 */
+        fun grantAgent(sessionId: String) {
+            val current = uiState.value ?: return
+            val pending = current.pendingAgent
+            if (pending == null || pending.sessionId != sessionId) return
+            uiState.postValue(current.copy(pendingAgent = null))
+            pendingAgentDecisions.remove(sessionId)?.complete(true)
+        }
+
+        /** 用户在任务级授权对话框点"拒绝"或取消。 */
+        fun denyAgent(sessionId: String) {
+            val current = uiState.value ?: return
+            val pending = current.pendingAgent
+            if (pending == null || pending.sessionId != sessionId) return
+            uiState.postValue(current.copy(pendingAgent = null))
+            pendingAgentDecisions.remove(sessionId)?.complete(false)
         }
     }
 
@@ -174,7 +230,7 @@ class VoiceCommandService : Service(), RecognitionListener {
             if (!text.isNullOrBlank()) {
                 cancelActiveListening()
                 handleRecognizedText(
-                    text = text,
+                    textRaw = text,
                     restartAfterProcessing = intent.getBooleanExtra(EXTRA_KEEP_RUNNING, false),
                     stopAfterProcessing = !intent.getBooleanExtra(EXTRA_KEEP_RUNNING, false)
                 )
@@ -317,10 +373,16 @@ class VoiceCommandService : Service(), RecognitionListener {
     }
 
     private fun handleRecognizedText(
-        text: String,
+        textRaw: String,
         restartAfterProcessing: Boolean = true,
         stopAfterProcessing: Boolean = false
     ) {
+        // ASR 引擎偶尔会输出"重复一遍"的合成文本（"...帅...帅"），或者输入流双触发拼接。
+        // 检测整段是否由两段相同子串拼成，是就只取一段——避免 AI 看到"重复闲聊"判 Unknown。
+        val text = deduplicateRepeatedText(textRaw)
+        if (text != textRaw) {
+            AiAgentLog.w("voice.dedupe", "原始文本 \"$textRaw\" 检测到首尾重复，去重后 \"$text\"")
+        }
         toast(getString(R.string.format_voice_command_heard, text))
         updateUiState {
             it.copy(
@@ -468,16 +530,348 @@ class VoiceCommandService : Service(), RecognitionListener {
                 gateAssessment = gateResult.assessment,
                 matchedGrantIds = gateResult.matchedGrants.map { it.id }
             )
-            is VoiceAiInterpretation.CreateTaskDraft -> handleCreateTaskDraft(
-                text = text,
-                interpretation = interpretation,
-                plan = plan,
-                gateAssessment = gateResult.assessment,
-                matchedGrantIds = gateResult.matchedGrants.map { it.id }
-            )
+            is VoiceAiInterpretation.CreateTaskDraft -> {
+                // 启用了 agent 模式 → 不再只生成文字草稿，先尝试让 AI 真的去 App 里干一次。
+                // 失败（AI 判定 estimated_steps=0、provider 错误等）才回退到文字草稿弹窗。
+                val handled = if (Preferences.aiAgentEnabled) {
+                    runAgentFlow(text)
+                } else {
+                    false
+                }
+                if (!handled) {
+                    handleCreateTaskDraft(
+                        text = text,
+                        interpretation = interpretation,
+                        plan = plan,
+                        gateAssessment = gateResult.assessment,
+                        matchedGrantIds = gateResult.matchedGrants.map { it.id }
+                    )
+                }
+            }
             is VoiceAiInterpretation.Unknown -> Unit // already returned above
         }
         return Unit
+    }
+
+    /**
+     * Agent 流程：planSession → 等用户授权 → 启动 [AiAgentSession] → 每步追加到 records。
+     *
+     * 返回 true 表示已经走完 agent 流程（成功 / 拒绝 / 失败均算"已处理"），调用方不应再走旧的
+     * 文字草稿路径。返回 false 表示 AI 自己判断"这事儿不需要 agent"，让上层回退。
+     */
+    private suspend fun runAgentFlow(text: String): Boolean {
+        appendRecord(
+            title = getString(R.string.voice_record_agent_planning),
+            detail = getString(R.string.voice_record_agent_planning_detail)
+        )
+        val planResult = AiAgentPlanner.planSession(text)
+        if (planResult == null) {
+            appendRecord(
+                title = getString(R.string.voice_record_agent_unconfigured),
+                detail = getString(R.string.voice_record_agent_unconfigured_detail),
+                result = VoiceCommandRecordResult.FAILURE
+            )
+            return false
+        }
+        val plan = planResult.plan
+        if (plan == null) {
+            appendRecord(
+                title = getString(R.string.voice_record_agent_plan_failed),
+                detail = planResult.providerError
+                    ?: getString(R.string.voice_record_agent_plan_failed_detail),
+                result = VoiceCommandRecordResult.FAILURE,
+                prompt = planResult.prompt,
+                rawResponse = planResult.rawResponse
+            )
+            return false
+        }
+        if (!plan.isExecutable) {
+            // AI 判断这事儿不需要 agent，让上层回退到文字草稿弹窗
+            appendRecord(
+                title = getString(R.string.voice_record_agent_skipped),
+                detail = plan.summary,
+                prompt = planResult.prompt,
+                rawResponse = planResult.rawResponse
+            )
+            return false
+        }
+
+        val sessionId = UUID.randomUUID().toString()
+        val targetApps = plan.targetAppPackage?.let { setOf(it) } ?: emptySet()
+        val maxSteps = Preferences.aiAgentMaxSteps.coerceIn(1, 100)
+        val maxSeconds = Preferences.aiAgentMaxSeconds.coerceIn(10, 600)
+
+        appendRecord(
+            title = getString(R.string.voice_record_agent_planned),
+            detail = getString(
+                R.string.format_voice_record_agent_planned,
+                plan.targetAppLabel ?: plan.targetAppPackage ?: "—",
+                plan.estimatedSteps
+            ),
+            prompt = planResult.prompt,
+            rawResponse = planResult.rawResponse
+        )
+
+        // 暴露给 UI，等待用户授权
+        val payload = AgentRequestPayload(
+            sessionId = sessionId,
+            userGoal = text,
+            plan = plan,
+            targetApps = targetApps,
+            maxSteps = maxSteps,
+            maxSeconds = maxSeconds
+        )
+        val decision = CompletableDeferred<Boolean>()
+        pendingAgentDecisions[sessionId] = decision
+        updateUiState { it.copy(pendingAgent = payload) }
+
+        // 60 秒内用户没决策视为拒绝，避免 service 一直挂着。
+        val granted = withTimeoutOrNull(60_000L) { decision.await() } ?: false
+        pendingAgentDecisions.remove(sessionId)
+        if (uiState.value?.pendingAgent?.sessionId == sessionId) {
+            updateUiState { it.copy(pendingAgent = null) }
+        }
+        if (!granted) {
+            appendRecord(
+                title = getString(R.string.voice_record_agent_denied),
+                detail = getString(R.string.voice_record_agent_denied_detail),
+                result = VoiceCommandRecordResult.FAILURE
+            )
+            return true
+        }
+
+        // 用户允许：构造 scope，启动 session
+        val scope = AiTaskScope(
+            sessionId = sessionId,
+            userGoal = text,
+            targetApps = targetApps,
+            // 默认补齐 agent 必备能力，避免 AI 临时输出 launch_app 时被自家 scope 拦下
+            capabilities = plan.capabilities + setOf(
+                AiCapability.ReadNodeTree,
+                AiCapability.ClickUi,
+                AiCapability.InputText,
+                AiCapability.LaunchIntent
+            ),
+            maxSteps = maxSteps,
+            maxDurationSeconds = maxSeconds
+        )
+        AiTaskScopeStore.grant(scope)
+        updateUiState { it.copy(activeAgentSessionId = sessionId) }
+        appendRecord(
+            title = getString(R.string.voice_record_agent_started),
+            detail = getString(
+                R.string.format_voice_record_agent_started,
+                plan.targetAppLabel ?: plan.targetAppPackage ?: "—",
+                maxSteps,
+                maxSeconds
+            )
+        )
+
+        // 决策面板：每步在执行前征询用户同意 / 拒绝 / 换一个。
+        // 没授 SYSTEM_ALERT_WINDOW / 用户在 Preferences 里关了模式，overlay 自动降级 noop。
+        val overlay = AiAgentOverlayController(this)
+        overlay.show()
+        val session = AiAgentSession(
+            scope = scope,
+            plan = plan,
+            overlay = overlay,
+            picker = InspectorPickerStub(),
+            callbacks = object : AiAgentSession.Callbacks {
+                override fun onStep(record: AiAgentStepRecord) {
+                    appendStepRecord(record)
+                    // 节点高亮：让用户亲眼看到 AI 命中了哪个节点。
+                    record.result.matchedNodeSummary?.let {
+                        // matchedNodeSummary 不带 bounds；先实现最低成本的"显示发生了什么"，
+                        // bounds 高亮等下一轮把 AiAgentStepResult 加 bounds 字段后接通。
+                    }
+                }
+
+                override fun onComplete(outcome: AiAgentSessionOutcome) {
+                    // 这里只做兜底，外层 run() 返回后会写一次完整结果
+                }
+            }
+        )
+        val outcome = runCatching { session.run() }.getOrElse {
+            AiAgentSessionOutcome.AiError(
+                reason = "agent 协程异常: ${it.message ?: it::class.simpleName}",
+                history = emptyList(),
+                lastRecord = AiAgentStepRecord(
+                    index = 0,
+                    action = AiAgentAction.Unknown(it.message.orEmpty()),
+                    result = top.xjunz.tasker.ai.agent.AiAgentStepResult(false, it.message)
+                )
+            )
+        }
+        AiTaskScopeStore.revoke(sessionId)
+        overlay.dismiss()
+        updateUiState { it.copy(activeAgentSessionId = null) }
+        appendOutcomeRecord(outcome, plan)
+        return true
+    }
+
+    private fun appendStepRecord(record: AiAgentStepRecord) {
+        val planStatus = top.xjunz.tasker.ai.agent.AiAgentPlanStatus.parse(record.action.planStatus)
+        val planLabel = planStatusLabel(planStatus)
+        val title = getString(
+            R.string.format_voice_record_agent_step_with_status,
+            record.index + 1,
+            planLabel,
+            describeAgentAction(record.action)
+        )
+        val detail = buildString {
+            record.action.thought?.takeIf { it.isNotBlank() }?.let {
+                append("思考：")
+                append(it)
+                append('\n')
+            }
+            append(if (record.result.ok) "OK" else "FAIL")
+            record.result.matchedNodeSummary?.let {
+                append(" · ")
+                append(it)
+            }
+            record.result.message?.takeIf { it.isNotBlank() }?.let {
+                append(" · ")
+                append(it)
+            }
+        }
+        // off_track 视觉上显眼一点（即便是 OK），便于审计时一眼挑出来
+        val resultColor = when {
+            !record.result.ok -> VoiceCommandRecordResult.FAILURE
+            planStatus == top.xjunz.tasker.ai.agent.AiAgentPlanStatus.OffTrack ->
+                VoiceCommandRecordResult.FAILURE
+            else -> VoiceCommandRecordResult.INFO
+        }
+        appendRecord(
+            title = title,
+            detail = detail,
+            result = resultColor
+        )
+    }
+
+    private fun planStatusLabel(status: top.xjunz.tasker.ai.agent.AiAgentPlanStatus): String {
+        return when (status) {
+            top.xjunz.tasker.ai.agent.AiAgentPlanStatus.OnTrack -> getString(R.string.ai_plan_status_on_track)
+            top.xjunz.tasker.ai.agent.AiAgentPlanStatus.Adjusted -> getString(R.string.ai_plan_status_adjusted)
+            top.xjunz.tasker.ai.agent.AiAgentPlanStatus.OffTrack -> getString(R.string.ai_plan_status_off_track)
+            top.xjunz.tasker.ai.agent.AiAgentPlanStatus.Unknown -> getString(R.string.ai_plan_status_unknown)
+        }
+    }
+
+    private fun appendOutcomeRecord(
+        outcome: AiAgentSessionOutcome,
+        plan: AiAgentSessionPlan? = null
+    ) {
+        val (title, result) = when (outcome) {
+            is AiAgentSessionOutcome.Completed ->
+                getString(R.string.voice_record_agent_completed) to VoiceCommandRecordResult.SUCCESS
+            is AiAgentSessionOutcome.GivenUp ->
+                getString(R.string.voice_record_agent_given_up) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.LimitExceeded ->
+                getString(R.string.voice_record_agent_limit) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.OutOfScope ->
+                getString(R.string.voice_record_agent_out_of_scope) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.PermissionDenied ->
+                getString(R.string.voice_record_agent_permission_denied) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.AiError ->
+                getString(R.string.voice_record_agent_ai_error) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.Cancelled ->
+                getString(R.string.voice_record_agent_cancelled) to VoiceCommandRecordResult.FAILURE
+            is AiAgentSessionOutcome.ServiceNotConnected ->
+                getString(R.string.voice_record_agent_service_not_connected) to VoiceCommandRecordResult.FAILURE
+        }
+        val baseDetail = when (outcome) {
+            is AiAgentSessionOutcome.Completed -> outcome.summary
+            is AiAgentSessionOutcome.GivenUp -> outcome.reason
+            is AiAgentSessionOutcome.LimitExceeded -> outcome.reason
+            is AiAgentSessionOutcome.OutOfScope -> getString(
+                R.string.format_voice_record_agent_out_of_scope_detail, outcome.currentPackage
+            )
+            is AiAgentSessionOutcome.PermissionDenied -> getString(
+                R.string.format_voice_record_agent_permission_denied_detail,
+                outcome.capability.name
+            )
+            is AiAgentSessionOutcome.AiError -> outcome.reason
+            is AiAgentSessionOutcome.Cancelled -> getString(R.string.voice_record_agent_cancelled_detail)
+            is AiAgentSessionOutcome.ServiceNotConnected ->
+                getString(R.string.voice_record_agent_service_not_connected_detail)
+        }
+        val detail = buildString {
+            append(baseDetail)
+            val statsLine = buildPlanStatsLine(outcome.history, plan)
+            if (statsLine.isNotEmpty()) {
+                append('\n')
+                append(statsLine)
+            }
+        }
+        appendRecord(title = title, detail = detail, result = result)
+    }
+
+    /**
+     * 拼一行"实际 N 步 / 估计 M 步 · on_track A · adjusted B · off_track C"统计，便于审计快速看
+     * AI 是否在正轨上、跑偏了多少。`plan == null` 时只展示步数和分布，不带"估计"。
+     */
+    private fun buildPlanStatsLine(
+        history: List<AiAgentStepRecord>,
+        plan: AiAgentSessionPlan?
+    ): String {
+        if (history.isEmpty()) return ""
+        var onTrack = 0
+        var adjusted = 0
+        var offTrack = 0
+        var unknown = 0
+        history.forEach { rec ->
+            when (top.xjunz.tasker.ai.agent.AiAgentPlanStatus.parse(rec.action.planStatus)) {
+                top.xjunz.tasker.ai.agent.AiAgentPlanStatus.OnTrack -> onTrack++
+                top.xjunz.tasker.ai.agent.AiAgentPlanStatus.Adjusted -> adjusted++
+                top.xjunz.tasker.ai.agent.AiAgentPlanStatus.OffTrack -> offTrack++
+                top.xjunz.tasker.ai.agent.AiAgentPlanStatus.Unknown -> unknown++
+            }
+        }
+        return if (plan != null) {
+            getString(
+                R.string.format_voice_record_agent_plan_stats,
+                history.size,
+                plan.estimatedSteps,
+                onTrack,
+                adjusted,
+                offTrack,
+                unknown
+            )
+        } else {
+            getString(
+                R.string.format_voice_record_agent_plan_stats_no_plan,
+                history.size,
+                onTrack,
+                adjusted,
+                offTrack,
+                unknown
+            )
+        }
+    }
+
+    private fun describeAgentAction(action: AiAgentAction): String = when (action) {
+        is AiAgentAction.LaunchApp -> "launch ${action.packageName}"
+        is AiAgentAction.Click -> "click ${formatAgentTarget(action.target)}"
+        is AiAgentAction.LongClick -> "long_click ${formatAgentTarget(action.target)}"
+        is AiAgentAction.SetText -> "set_text \"${action.text.take(30)}\" → ${formatAgentTarget(action.target)}"
+        is AiAgentAction.Wait -> "wait ${action.seconds}s"
+        is AiAgentAction.Scroll -> "scroll ${action.direction}"
+        is AiAgentAction.GlobalBack -> "back"
+        is AiAgentAction.GlobalHome -> "home"
+        is AiAgentAction.Done -> "done"
+        is AiAgentAction.GiveUp -> "give_up"
+        is AiAgentAction.Unknown -> "unknown"
+    }
+
+    private fun formatAgentTarget(t: top.xjunz.tasker.ai.agent.AiUiTarget): String {
+        val parts = mutableListOf<String>()
+        t.viewId?.let { parts.add("id=$it") }
+        t.textEquals?.let { parts.add("text=$it") }
+        t.textContains?.let { parts.add("text~$it") }
+        t.contentDescEquals?.let { parts.add("desc=$it") }
+        t.contentDescContains?.let { parts.add("desc~$it") }
+        t.className?.let { parts.add("cls=$it") }
+        return parts.joinToString(",").take(80).ifEmpty { "(?)" }
     }
 
     /**
@@ -914,9 +1308,15 @@ class VoiceCommandService : Service(), RecognitionListener {
         if (exactMatches.size > 1) return MatchResult.Ambiguous(exactMatches)
 
         val normalizedQuery = query.normalizedForVoiceMatch()
+        // **只保留正向匹配**：title 完整包含 query。
+        // 反向匹配（query 包含 title）历史上引起过严重 bug：用户输入"打开 deepseek 问问我为什么这么帅"，
+        // 本地任意一个名为"打开 deepseek"或"deepseek"的旧 task 都会被 normalizedQuery.contains(title)
+        // 命中，触发"直接匹配"分支直接执行老 task，AI agent 永远不启动。
+        // 正向匹配符合"短命令命中长 task 名"的合理直觉（比如"打开微信"命中"打开微信发朋友圈"），
+        // 反向是反人类的——用户长复杂命令里碰巧含某个 task 标题就直接执行，应该让 AI 决策。
         val fuzzyMatches = tasks.filter {
             val title = it.title.normalizedForVoiceMatch()
-            title.contains(normalizedQuery) || normalizedQuery.contains(title)
+            title.contains(normalizedQuery)
         }
         return when (fuzzyMatches.size) {
             0 -> MatchResult.NotFound
@@ -927,6 +1327,26 @@ class VoiceCommandService : Service(), RecognitionListener {
 
     private fun String.normalizedForVoiceMatch(): String {
         return lowercase(Locale.getDefault()).replace(Regex("[\\s，。,.！!？?：:；;“”\"'、]"), "")
+    }
+
+    /**
+     * 去除"整段由两段相同子串前后拼接"的脏数据，常见于：
+     * - ASR 引擎在用户卡顿时把同一段话识别两遍并拼接；
+     * - 触摸事件双触发让同一文本被两次入队。
+     *
+     * 仅在偶数长度 + 上下半完全一致 + 长度 ≥ 6 字符时去重，避免误伤"哈哈"等正常重叠词。
+     * 也兼顾"中间多个空格"的场景：先 normalize 空白再比较。
+     */
+    private fun deduplicateRepeatedText(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.length < 6) return raw
+        val normalized = trimmed.replace(Regex("\\s+"), "")
+        val len = normalized.length
+        if (len % 2 != 0) return raw
+        val half = len / 2
+        val first = normalized.substring(0, half)
+        val second = normalized.substring(half)
+        return if (first == second) first else raw
     }
 
     private fun updateNotification(text: String) {

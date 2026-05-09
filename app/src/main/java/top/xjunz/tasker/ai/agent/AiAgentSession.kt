@@ -1,0 +1,598 @@
+/*
+ * Copyright (c) 2026 IanVzs. All rights reserved.
+ */
+
+package top.xjunz.tasker.ai.agent
+
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.coroutineScope
+import top.xjunz.tasker.Preferences
+import top.xjunz.tasker.ai.agent.overlay.AiAgentConfirmMode
+import top.xjunz.tasker.ai.agent.overlay.AiAgentDecision
+import top.xjunz.tasker.ai.agent.overlay.AiAgentNodePicker
+import top.xjunz.tasker.ai.agent.overlay.AiAgentOverlayController
+import top.xjunz.tasker.ai.agent.overlay.InspectorPickerStub
+import top.xjunz.tasker.task.inspector.shared.UiTreeQuery
+
+/**
+ * Agent 模式的执行循环。
+ *
+ * 使用方式：
+ * 1. UI 层先用 [AiAgentPlanner.planSession] 拿到 [AiAgentSessionPlan]，弹"任务级授权"对话框给用户。
+ * 2. 用户点允许 → 写一条 [AiTaskScope] 进 [AiTaskScopeStore]。
+ * 3. 构造 [AiAgentSession] 并 [run]。Session 在协程里跑，每步通过 [callbacks] 回调出去，
+ *    UI 实时把进度追加到记录卡片，**不再有任何中途弹窗**。
+ *
+ * Session 自己不创建协程，调用方负责 launch；这样 cancel / 生命周期管理留给上层。
+ */
+class AiAgentSession(
+    val scope: AiTaskScope,
+    /**
+     * 开场 [AiAgentPlanner.planSession] 出的初始规划。每步 [AiAgentPlanner.nextAction] 都会带上它，
+     * 让 AI 自检"是否还在原计划路径上"，并在 history 与 outcome 里沉淀 plan_status。
+     * 允许 null（未走 planSession 的极端场景），prompt 会退化为"无原计划"模式。
+     */
+    val plan: AiAgentSessionPlan? = null,
+    /**
+     * 决策面板控制器。允许 null（无 UI 上下文，比如 service context 拿不到的场景）；
+     * 非 null 但 `isAvailable() == false`（用户没授悬浮窗权限）时，所有决策都自动 [AiAgentDecision.Skipped]。
+     */
+    private val overlay: AiAgentOverlayController? = null,
+    private val picker: AiAgentNodePicker = InspectorPickerStub(),
+    private val callbacks: Callbacks
+) {
+
+    interface Callbacks {
+        /** 每完成一步（不论成功失败）都会回调。 */
+        fun onStep(record: AiAgentStepRecord)
+
+        /** AI 当前正在思考下一步，UI 可以显示个 loading 状态。 */
+        fun onThinking(stepIndex: Int) {}
+
+        /** 整个会话结束，附上完整 outcome。 */
+        fun onComplete(outcome: AiAgentSessionOutcome)
+    }
+
+    private val history = mutableListOf<AiAgentStepRecord>()
+    private var stepIndex = 0
+
+    /**
+     * 已确认 silent-fail 的 target 黑名单，按 packageName 隔离——同一 viewId 在不同 App / 不同
+     * Activity 含义不同，所以**不**全局共享。每页面独立维护。
+     *
+     * 维护规则：
+     * - 上一步 silent-fail 检测命中（snapshot 签名前后一致）时，把上一步的 target 哈希加入当前 pkg 的集合；
+     * - 下一轮调 [AiAgentPlanner.nextAction] 时把当前 pkg 的列表喂进去，prompt 顶部硬列"禁选区"；
+     * - AI 仍输出黑名单内 target → session 直接拒收（写一条更强反馈），不浪费一次 perform。
+     *
+     * 这是用户在 deepseek 测试反馈"AI 一直点错节点"的核心修法——单纯在 history 里追加 ⚠
+     * 提示对 AI 引导力不够，必须用最显眼的"禁选区"配合 session 兜底拒收。
+     */
+    private val deadTargetsByPkg = mutableMapOf<String, MutableSet<String>>()
+
+    /**
+     * 同一 (pkg, target) 命中 silent-fail 的次数。**累计 ≥ 2 才永久拉黑**，给"动画延迟期 click 不响应"
+     * 留一次重试机会。
+     *
+     * 真实场景：deepseek/淘宝/京东这种重启动画的 App，启动后第一次 click 经常被状态机吞掉，
+     * 屏幕节点签名不变；但**再次 click 同一节点**就生效了。如果第一次 silent-fail 直接拉黑，
+     * 反而把唯一正确的入口锁死，AI 找不到出路。
+     */
+    private val silentFailHitsByPkgAndTarget = mutableMapOf<String, MutableMap<String, Int>>()
+
+    /**
+     * 连续 AI 解析失败次数。第一次允许重试（给网络抖动一次机会），第二次才真终止 session。
+     * 任何**成功解析**的步骤会清零。这是用户在 deepseek 测试遇到的问题：单次 8s timeout
+     * 就把整段 session 灭了，太脆弱。
+     */
+    private var consecutiveAiErrors = 0
+
+    /**
+     * 进入循环；返回值与最后一次 [Callbacks.onComplete] 一致，方便调用方就地拿到结果。
+     */
+    suspend fun run(): AiAgentSessionOutcome = coroutineScope {
+        AiAgentLog.i(
+            "session.start",
+            "id=${scope.sessionId} goal=\"${scope.userGoal}\" " +
+                    "apps=${scope.targetApps} caps=${scope.capabilities} " +
+                    "max=${scope.maxSteps}步/${scope.maxDurationSeconds}s " +
+                    "planExecutable=${plan?.isExecutable}"
+        )
+        // Precheck: a11y / Shizuku 任一服务未启动 → agent 完全瞎，立刻终止避免浪费 token 跑空循环。
+        if (!UiTreeQuery.isAutomatorServiceRunning()) {
+            AiAgentLog.w("session.precheck", "AutomatorService 未运行（a11y / Shizuku 都没连），agent 无法读屏，立刻终止")
+            val outcome = AiAgentSessionOutcome.ServiceNotConnected(history.toList())
+            callbacks.onComplete(outcome)
+            return@coroutineScope outcome
+        }
+        val outcome = runLoop(this)
+        AiAgentLog.i(
+            "session.end",
+            "id=${scope.sessionId} outcome=${outcome::class.simpleName} steps=${outcome.history.size}"
+        )
+        callbacks.onComplete(outcome)
+        outcome
+    }
+
+    private suspend fun runLoop(scopeCtx: kotlinx.coroutines.CoroutineScope): AiAgentSessionOutcome {
+        while (scopeCtx.isActive) {
+            // ---- 边界检查 ----
+            if (stepIndex >= scope.maxSteps) {
+                AiAgentLog.w("session.limit", "已达最大步数 ${scope.maxSteps}")
+                return AiAgentSessionOutcome.LimitExceeded(history.toList(), reason = "已达最大步数 ${scope.maxSteps}")
+            }
+            if (System.currentTimeMillis() >= scope.deadlineMillis) {
+                AiAgentLog.w("session.limit", "已达最大时长 ${scope.maxDurationSeconds}s")
+                return AiAgentSessionOutcome.LimitExceeded(history.toList(), reason = "已达最大时长 ${scope.maxDurationSeconds}s")
+            }
+
+            // ---- 抓快照 ----
+            val snapshot = ScreenSnapshotProvider.capture()
+            val pkg = snapshot?.packageName
+            val currentSig = snapshot?.let { computeSnapshotSignature(it) }
+
+            // ---- 上一步 silent-fail 检测 ----
+            // 真实场景：deepseek 启动页 AI 把 TextView 误当输入框 click，task 报 OK 但屏幕节点
+            // 签名前后一致——说明动作没让 UI 产生可见变化（节点选错 / 节点不响应）。
+            // 把这条提示追加到 history 最后一项的 result.message，下一轮 prompt 让 AI 看见，
+            // 配合 prompt 里的"换策略"准则，AI 会自己换 viewId / scroll / give_up。
+            // 0 额外快照抓取——复用本轮抓的 snapshot 跟上一步保存的 preActionSignature 比对。
+            if (history.isNotEmpty() && currentSig != null) {
+                val last = history.last()
+                if (last.preActionSignature != null &&
+                    last.preActionSignature == currentSig &&
+                    last.result.ok &&
+                    actionMayChangeUi(last.action)
+                ) {
+                    AiAgentLog.w(
+                        "session.silentFail",
+                        "上一步 ${last.action::class.simpleName} 执行后屏幕节点签名未变化——" +
+                                "目标可能选错 / 控件不响应"
+                    )
+                    // **二次拉黑机制**：第一次 silent-fail 只**计数 + 提示**（给动画延迟一次机会），
+                    // 第二次同一 target silent-fail 才永久拉黑。避免把"启动期偶尔吞 click 但其实正确"的入口锁死。
+                    val pkgKey = last.snapshotPackage ?: pkg ?: "*"
+                    val targetHash = actionTargetHash(last.action)
+                    val hits = if (targetHash != null) {
+                        silentFailHitsByPkgAndTarget
+                            .getOrPut(pkgKey) { mutableMapOf() }
+                            .merge(targetHash, 1, Int::plus) ?: 1
+                    } else 1
+                    val msgSuffix = if (hits == 1) {
+                        " ⚠ 执行后屏幕没有任何可见变化（节点签名前后一致）。可能是动画延迟或节点不响应——" +
+                                "**允许你再试一次**同一 target；如果再次无效就请换 target / scroll / give_up。"
+                    } else {
+                        " ⚠ 执行后屏幕仍无变化，**已是第 ${hits} 次** silent fail。该 target 已被永久拉黑——" +
+                                "必须换其他节点 / scroll / give_up。"
+                    }
+                    val patched = last.copy(
+                        result = last.result.copy(
+                            message = (last.result.message ?: "task 执行完成") + msgSuffix
+                        )
+                    )
+                    history[history.size - 1] = patched
+                    if (hits >= 2 && targetHash != null) {
+                        deadTargetsByPkg.getOrPut(pkgKey) { mutableSetOf() }.add(targetHash)
+                        AiAgentLog.w("session.blacklist", "已拉黑 pkg=$pkgKey target=$targetHash (累计 $hits 次 silent fail)")
+                    } else {
+                        AiAgentLog.w("session.silentFailFirstChance", "pkg=$pkgKey target=$targetHash 第一次 silent fail，给一次重试机会")
+                    }
+                }
+            }
+
+            // ---- App scope 检查 ----
+            // 第一步前 App 还没启动是正常的（AI 可能要先 launch_app），允许 snapshot 为 null 或 在桌面/launcher。
+            // 但一旦 history 里已经有 launch_app 成功后，AI 又跑去其他 App，立刻停下。
+            if (pkg != null && history.isNotEmpty() && !scope.coversApp(pkg) && !isLauncherOrSystem(pkg)) {
+                AiAgentLog.w("session.outOfScope", "当前包 $pkg 不在授权 ${scope.targetApps} 内，停止")
+                return AiAgentSessionOutcome.OutOfScope(
+                    history = history.toList(),
+                    currentPackage = pkg
+                )
+            }
+
+            // ---- 问 AI ----
+            callbacks.onThinking(stepIndex)
+            val deadList = pkg?.let { deadTargetsByPkg[it]?.toList() }.orEmpty()
+            val nextResult = AiAgentPlanner.nextAction(
+                userGoal = scope.userGoal,
+                history = history,
+                snapshot = snapshot,
+                plan = plan,
+                maxSteps = scope.maxSteps,
+                deadTargets = deadList
+            )
+
+            val action = nextResult.action
+
+            // ---- 黑名单兜底拒收：AI 仍然输出禁选 target → 直接短路，不浪费 perform ----
+            // prompt 已经显式列出禁选区，AI 还输出说明 prompt 引导失败，必须用程序硬拦。
+            val targetHash = actionTargetHash(action)
+            if (targetHash != null && pkg != null && deadTargetsByPkg[pkg]?.contains(targetHash) == true) {
+                AiAgentLog.w(
+                    "session.deadTarget",
+                    "AI 又输出禁选 target=$targetHash 在 pkg=$pkg；session 拒收并提示换思路"
+                )
+                val record = AiAgentStepRecord(
+                    index = stepIndex,
+                    action = action,
+                    result = AiAgentStepResult(
+                        ok = false,
+                        message = "禁选 target：$targetHash 已在本页面试过且无任何反应——请彻底换思路（不同 target / scroll / wait / give_up）。"
+                    ),
+                    snapshotPackage = pkg
+                )
+                history += record
+                callbacks.onStep(record)
+                stepIndex++
+                delay(150)
+                continue
+            }
+
+            // ---- 终止条件 ----
+            when (action) {
+                is AiAgentAction.Done -> {
+                    val record = recordNoOpStep(action, snapshot, ok = true, message = action.summary)
+                    return AiAgentSessionOutcome.Completed(action.summary, history.toList(), lastRecord = record)
+                }
+                is AiAgentAction.GiveUp -> {
+                    val record = recordNoOpStep(action, snapshot, ok = false, message = action.reason)
+                    return AiAgentSessionOutcome.GivenUp(action.reason, history.toList(), lastRecord = record)
+                }
+                is AiAgentAction.Unknown -> {
+                    consecutiveAiErrors++
+                    val isRetriable = consecutiveAiErrors < 2  // 给第一次失败一次重试机会
+                    val record = recordNoOpStep(
+                        action, snapshot, ok = false,
+                        message = if (isRetriable) {
+                            "AI 调用失败（${nextResult.providerError ?: "未知"}），将自动重试一次"
+                        } else {
+                            "AI 调用连续失败 ${consecutiveAiErrors} 次，session 终止：${nextResult.providerError ?: action.raw}"
+                        }
+                    )
+                    if (isRetriable) {
+                        AiAgentLog.w(
+                            "session.aiRetry",
+                            "AI 第 $consecutiveAiErrors 次失败，等 1.5s 后重试：${nextResult.providerError}"
+                        )
+                        delay(1500)
+                        continue
+                    }
+                    return AiAgentSessionOutcome.AiError(
+                        reason = nextResult.providerError ?: action.raw,
+                        history = history.toList(),
+                        lastRecord = record
+                    )
+                }
+                else -> {
+                    // 成功解析任何 action → 清零失败计数（让间歇性失败不至于累积到上限）
+                    consecutiveAiErrors = 0
+                }
+            }
+
+            // ---- 防"AI 看不到 App 已启动 → 反复 launch 同一 pkg"卡死 ----
+            // 现象：京东/淘宝这种大 App 冷启动期间，AI 拿到的 snapshot 还是桌面，会再 launch 一次。
+            // 当前 snapshot pkg 已经是 AI 想 launch 的目标时，**不真的执行**，写一条反馈让 AI
+            // 在下一轮看到"已经在前台了，请基于现有节点决定下一步"，避免 6 步全是 launch_app。
+            if (action is AiAgentAction.LaunchApp && pkg != null && pkg == action.packageName) {
+                AiAgentLog.w(
+                    "session.skipRelaunch",
+                    "AI 又想 launch_app($pkg) 但当前前台已是 $pkg，短路并提示 AI"
+                )
+                val record = AiAgentStepRecord(
+                    index = stepIndex,
+                    action = action,
+                    result = AiAgentStepResult(
+                        ok = false,
+                        message = "$pkg 已在前台，无需再次 launch_app；请基于当前节点决定下一步动作（点击 / 输入 / 滚动 / done）"
+                    ),
+                    snapshotPackage = pkg
+                )
+                history += record
+                callbacks.onStep(record)
+                stepIndex++
+                delay(150)
+                continue
+            }
+
+            // 注：旧的 skipRepeatClick "上一步刚 click 同 target 直接拦截" 已删除——
+            // 新的 silent-fail 二次拉黑机制更精细：第一次允许重试（给动画延迟一次机会），
+            // 第二次永久拉黑后由 deadTarget 拒收。skipRepeatClick 跟二次机会冲突会把唯一正确入口锁死。
+
+            // ---- capability 边界（轻量校验）----
+            val capability = action.requiredCapability()
+            if (capability != null && !scope.covers(capability)) {
+                AiAgentLog.w(
+                    "session.denyCap",
+                    "AI 想用 $capability 但本次 scope 没有，停止 (scope.caps=${scope.capabilities})"
+                )
+                val record = recordNoOpStep(
+                    action, snapshot, ok = false,
+                    message = "用到未授权能力：$capability"
+                )
+                return AiAgentSessionOutcome.PermissionDenied(
+                    capability = capability,
+                    history = history.toList(),
+                    lastRecord = record
+                )
+            }
+
+            // ---- 决策面板：用户介入（同意 / 拒绝 / 换一个）----
+            // 仅对"有 UI 副作用"的动作征询，wait 等无副作用动作直接放行。
+            // overlay 不可用 / 用户在 Preferences 里禁用 / ManualOnly 模式但没人点 → Skipped。
+            val decision: AiAgentDecision = if (overlay != null && actionNeedsConfirmation(action)) {
+                val mode = AiAgentConfirmMode.parse(Preferences.aiAgentConfirmMode)
+                overlay.requestDecision(
+                    stepIndex = stepIndex,
+                    action = action,
+                    snapshot = snapshot,
+                    mode = mode,
+                    timeoutSeconds = Preferences.aiAgentConfirmSeconds.coerceIn(0, 60),
+                    allowReplace = Preferences.aiAgentConfirmAllowReplace,
+                    picker = picker
+                )
+            } else {
+                AiAgentDecision.Skipped
+            }
+
+            // 用户主动终止 → 整段 session 立刻结束，不执行当前 action，不再循环
+            if (decision is AiAgentDecision.Terminate) {
+                AiAgentLog.w("session.userTerminate", "用户在决策面板主动终止：${decision.reason ?: "(no reason)"}")
+                val record = AiAgentStepRecord(
+                    index = stepIndex,
+                    action = action,
+                    result = AiAgentStepResult(
+                        ok = false,
+                        message = "用户在决策面板按下「终止」：${decision.reason ?: "(no reason)"}"
+                    ),
+                    snapshotPackage = pkg,
+                    userIntervention = decision
+                )
+                history += record
+                callbacks.onStep(record)
+                return AiAgentSessionOutcome.Cancelled(history.toList())
+            }
+
+            val (executedAction, replacementHint) = when (decision) {
+                is AiAgentDecision.Replaced ->
+                    replaceTarget(action, decision.newTarget) to decision.replacementHint
+                else -> action to null
+            }
+
+            // ---- 执行 ----
+            val result = AiAgentExecutor.execute(executedAction)
+            val record = AiAgentStepRecord(
+                index = stepIndex,
+                action = executedAction,
+                result = result,
+                snapshotPackage = pkg,
+                userIntervention = decision.takeIf { it !is AiAgentDecision.Skipped },
+                // 把执行**之前**的屏幕签名记下来，下一轮抓到新 snapshot 时跟它比对——
+                // 签名一致就给 result.message 追加 silent-fail 警告，AI 在下一轮 prompt 看见就会换策略。
+                preActionSignature = currentSig
+            )
+            history += record
+            callbacks.onStep(record)
+            stepIndex++
+            // replacementHint 仅记录在 history.intervention 标签里给 AI 看，本地不需要再额外做事
+            @Suppress("UNUSED_VARIABLE")
+            val _hint = replacementHint
+
+            // 一些动作内部已经 delay 过；这里再加一个微小间隔让 UI 有时间处理回调。
+            delay(150)
+        }
+        return AiAgentSessionOutcome.Cancelled(history.toList())
+    }
+
+    /**
+     * "有 UI 副作用"判断：影响系统状态的动作走决策面板，无副作用动作（wait）直接放行。
+     * Done / GiveUp / Unknown 已经在 nextAction 之后立即 return，不会到这。
+     */
+    private fun actionNeedsConfirmation(action: AiAgentAction): Boolean = when (action) {
+        is AiAgentAction.LaunchApp,
+        is AiAgentAction.Click,
+        is AiAgentAction.LongClick,
+        is AiAgentAction.SetText,
+        is AiAgentAction.Scroll,
+        is AiAgentAction.GlobalBack,
+        is AiAgentAction.GlobalHome -> true
+        is AiAgentAction.Wait -> false
+        is AiAgentAction.Done,
+        is AiAgentAction.GiveUp,
+        is AiAgentAction.Unknown -> false
+    }
+
+    /** 把 AI 原 target 换成用户挑的真节点对应的新 target；不支持 target 的动作原样返回。 */
+    private fun replaceTarget(
+        action: AiAgentAction,
+        newTarget: AiUiTarget
+    ): AiAgentAction = when (action) {
+        is AiAgentAction.Click -> action.copy(target = newTarget)
+        is AiAgentAction.LongClick -> action.copy(target = newTarget)
+        is AiAgentAction.SetText -> action.copy(target = newTarget)
+        is AiAgentAction.Scroll -> action.copy(target = newTarget)
+        else -> action
+    }
+
+    /**
+     * 两个 target 是否"实质相同"——优先比 viewId（最强信号），其次比 textEquals + className 组合。
+     * 用于死循环检测：连续两次 click 同一节点时短路。
+     */
+    private fun sameTarget(a: AiUiTarget, b: AiUiTarget): Boolean {
+        if (!a.viewId.isNullOrBlank() && a.viewId == b.viewId) return true
+        if (a.viewId.isNullOrBlank() != b.viewId.isNullOrBlank()) return false
+        return a.textEquals == b.textEquals &&
+                a.textContains == b.textContains &&
+                a.contentDescEquals == b.contentDescEquals &&
+                a.contentDescContains == b.contentDescContains &&
+                a.className == b.className
+    }
+
+    private fun formatTargetForLog(t: AiUiTarget): String {
+        val parts = mutableListOf<String>()
+        t.viewId?.let { parts.add("id=$it") }
+        t.textEquals?.let { parts.add("text=$it") }
+        t.textContains?.let { parts.add("text~$it") }
+        t.contentDescEquals?.let { parts.add("desc=$it") }
+        t.className?.let { parts.add("cls=$it") }
+        return parts.joinToString(",").take(80).ifEmpty { "(?)" }
+    }
+
+    /**
+     * 统一的 target 哈希——格式跟 [formatTargetForLog] 一致，给 prompt 里的"禁选区"和
+     * session 兜底拒收用。无 target 的动作（done/giveup/wait 等）返回 null。
+     */
+    private fun actionTargetHash(action: AiAgentAction): String? {
+        val target = when (action) {
+            is AiAgentAction.Click -> action.target
+            is AiAgentAction.LongClick -> action.target
+            is AiAgentAction.SetText -> action.target
+            is AiAgentAction.Scroll -> action.target
+            else -> null
+        } ?: return null
+        return formatTargetForLog(target)
+    }
+
+    /**
+     * 计算 snapshot 的"指纹"——任何明显的页面切换都会让指纹变化，silent-fail 检测靠它判别。
+     *
+     * 指纹组成：
+     * - packageName + activityName：跳转 Activity 必然命中
+     * - 节点数 + 各类 flag 计数：弹窗 / 列表刷新会变
+     * - 首尾节点的 viewId / className：节点顺序变了也能感知
+     *
+     * 不取节点 text 等长字段——一些 App 的状态栏时间会每分钟变，引入噪音。
+     */
+    private fun computeSnapshotSignature(snapshot: AiUiSnapshot): String {
+        val nodes = snapshot.nodes
+        val clickable = nodes.count { it.clickable }
+        val editable = nodes.count { it.editable }
+        val scrollable = nodes.count { it.scrollable }
+        val first = nodes.firstOrNull()?.let { "${it.viewId.orEmpty()}|${it.className}" }.orEmpty()
+        val last = nodes.lastOrNull()?.let { "${it.viewId.orEmpty()}|${it.className}" }.orEmpty()
+        return "${snapshot.packageName}/${snapshot.activityName}#${nodes.size}c${clickable}e${editable}s${scrollable}|$first|$last"
+    }
+
+    /**
+     * 该动作"按理"应该改变屏幕（点击 / 输入 / 滚动 / 返回 / 启动 App）。
+     * 仅这些动作执行后屏幕没变化才报 silent-fail；wait 等等动作本就不改变屏幕，不算问题。
+     */
+    private fun actionMayChangeUi(action: AiAgentAction): Boolean = when (action) {
+        is AiAgentAction.LaunchApp,
+        is AiAgentAction.Click,
+        is AiAgentAction.LongClick,
+        is AiAgentAction.SetText,
+        is AiAgentAction.Scroll,
+        is AiAgentAction.GlobalBack,
+        is AiAgentAction.GlobalHome -> true
+        is AiAgentAction.Wait,
+        is AiAgentAction.Done,
+        is AiAgentAction.GiveUp,
+        is AiAgentAction.Unknown -> false
+    }
+
+    private fun recordNoOpStep(
+        action: AiAgentAction,
+        snapshot: AiUiSnapshot?,
+        ok: Boolean,
+        message: String?
+    ): AiAgentStepRecord {
+        val record = AiAgentStepRecord(
+            index = stepIndex,
+            action = action,
+            result = AiAgentStepResult(ok = ok, message = message),
+            snapshotPackage = snapshot?.packageName
+        )
+        history += record
+        callbacks.onStep(record)
+        stepIndex++
+        return record
+    }
+}
+
+/**
+ * 一些常见的"过场"包名，在 launch_app 之后短暂出现，不算"切到其他 App"。
+ */
+private val LAUNCHER_OR_SYSTEM = setOf(
+    "com.android.systemui",
+    "com.android.launcher",
+    "com.android.launcher3",
+    "com.miui.home",
+    "com.huawei.android.launcher",
+    "com.oppo.launcher",
+    "com.vivo.launcher",
+    "com.sec.android.app.launcher",
+    "com.google.android.apps.nexuslauncher",
+    "android"
+)
+
+private fun isLauncherOrSystem(pkg: String): Boolean = pkg in LAUNCHER_OR_SYSTEM ||
+        pkg.endsWith(".launcher") || pkg.endsWith(".launcher3")
+
+private fun AiAgentAction.requiredCapability(): top.xjunz.tasker.ai.model.AiCapability? = when (this) {
+    is AiAgentAction.LaunchApp -> top.xjunz.tasker.ai.model.AiCapability.LaunchIntent
+    is AiAgentAction.Click,
+    is AiAgentAction.LongClick,
+    is AiAgentAction.Scroll -> top.xjunz.tasker.ai.model.AiCapability.ClickUi
+    is AiAgentAction.SetText -> top.xjunz.tasker.ai.model.AiCapability.InputText
+    is AiAgentAction.GlobalBack,
+    is AiAgentAction.GlobalHome -> top.xjunz.tasker.ai.model.AiCapability.ClickUi
+    is AiAgentAction.Wait,
+    is AiAgentAction.Done,
+    is AiAgentAction.GiveUp,
+    is AiAgentAction.Unknown -> null
+}
+
+/**
+ * Session 的最终结果。所有分支都带 history，便于上层做"是否保存为任务"等后续处理。
+ */
+sealed class AiAgentSessionOutcome {
+    abstract val history: List<AiAgentStepRecord>
+
+    data class Completed(
+        val summary: String,
+        override val history: List<AiAgentStepRecord>,
+        val lastRecord: AiAgentStepRecord
+    ) : AiAgentSessionOutcome()
+
+    data class GivenUp(
+        val reason: String,
+        override val history: List<AiAgentStepRecord>,
+        val lastRecord: AiAgentStepRecord
+    ) : AiAgentSessionOutcome()
+
+    data class LimitExceeded(
+        override val history: List<AiAgentStepRecord>,
+        val reason: String
+    ) : AiAgentSessionOutcome()
+
+    data class OutOfScope(
+        override val history: List<AiAgentStepRecord>,
+        val currentPackage: String
+    ) : AiAgentSessionOutcome()
+
+    data class PermissionDenied(
+        val capability: top.xjunz.tasker.ai.model.AiCapability,
+        override val history: List<AiAgentStepRecord>,
+        val lastRecord: AiAgentStepRecord
+    ) : AiAgentSessionOutcome()
+
+    data class AiError(
+        val reason: String,
+        override val history: List<AiAgentStepRecord>,
+        val lastRecord: AiAgentStepRecord
+    ) : AiAgentSessionOutcome()
+
+    data class Cancelled(
+        override val history: List<AiAgentStepRecord>
+    ) : AiAgentSessionOutcome()
+
+    /**
+     * 启动前 precheck 失败：当前 [top.xjunz.tasker.service.serviceController] 报告 service 没启动。
+     * a11y 与 Shizuku 模式都没连，agent 完全无法读屏 / 派任务，直接终止避免浪费 token 跑空循环。
+     */
+    data class ServiceNotConnected(
+        override val history: List<AiAgentStepRecord>
+    ) : AiAgentSessionOutcome()
+}

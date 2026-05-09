@@ -37,6 +37,7 @@ import top.xjunz.tasker.ui.task.editor.FlowEditorDialog
 import top.xjunz.tasker.ui.task.showcase.TaskShowcaseViewModel
 import top.xjunz.tasker.util.ClickListenerUtil.setNoDoubleClickListener
 import top.xjunz.tasker.util.formatTime
+import top.xjunz.tasker.voice.AgentRequestPayload
 import top.xjunz.tasker.voice.VoiceCommandDraftPayload
 import top.xjunz.tasker.voice.VoiceCommandRecord
 import top.xjunz.tasker.voice.VoiceCommandRecordResult
@@ -51,6 +52,7 @@ class VoiceCommandFragment : BaseFragment<FragmentVoiceCommandBinding>(), Scroll
     private val taskShowcaseViewModel by activityViewModels<TaskShowcaseViewModel>()
 
     private var lastShownDraftId: String? = null
+    private var lastShownAgentRequestId: String? = null
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -131,6 +133,47 @@ class VoiceCommandFragment : BaseFragment<FragmentVoiceCommandBinding>(), Scroll
             lastShownDraftId = draft.id
             showAiDraftDialog(draft)
         }
+        val agent = state.pendingAgent
+        if (agent != null && agent.sessionId != lastShownAgentRequestId) {
+            lastShownAgentRequestId = agent.sessionId
+            showAgentAuthorizationDialog(agent)
+        }
+        if (agent == null) {
+            lastShownAgentRequestId = null
+        }
+    }
+
+    private fun showAgentAuthorizationDialog(payload: AgentRequestPayload) {
+        val plan = payload.plan
+        val targetAppLabel = plan.targetAppLabel
+            ?: plan.targetAppPackage
+            ?: getString(R.string.agent_capability_unspecified)
+        val capabilitiesText = if (plan.capabilities.isEmpty()) {
+            getString(R.string.agent_capability_unspecified)
+        } else {
+            plan.capabilities.joinToString("\n") { "• ${it.name}" }
+        }
+        val message = getString(
+            R.string.format_agent_authorize_message,
+            plan.summary,
+            targetAppLabel,
+            payload.maxSteps,
+            payload.maxSeconds,
+            capabilitiesText
+        )
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.agent_authorize_dialog_title)
+            .setMessage(message)
+            .setPositiveButton(R.string.agent_authorize_allow) { _, _ ->
+                VoiceCommandService.grantAgent(payload.sessionId)
+            }
+            .setNegativeButton(R.string.agent_authorize_deny) { _, _ ->
+                VoiceCommandService.denyAgent(payload.sessionId)
+            }
+            .setOnCancelListener {
+                VoiceCommandService.denyAgent(payload.sessionId)
+            }
+            .show()
     }
 
     private fun showAiDraftDialog(draft: VoiceCommandDraftPayload) {
@@ -321,7 +364,53 @@ class VoiceCommandFragment : BaseFragment<FragmentVoiceCommandBinding>(), Scroll
             .setTitle(R.string.ai_record_detail_dialog_title)
             .setMessage(message)
             .setPositiveButton(R.string.ai_record_detail_close, null)
+            .setNeutralButton(R.string.ai_record_detail_copy_all) { _, _ ->
+                copyToClipboard(
+                    label = getString(R.string.ai_record_detail_dialog_title),
+                    text = buildAiTraceCopyText(record)
+                )
+            }
+            .setNegativeButton(R.string.ai_record_detail_copy_response) { _, _ ->
+                val payload = record.rawResponse?.takeIf { it.isNotBlank() }
+                    ?: getString(R.string.ai_record_detail_empty_response)
+                copyToClipboard(
+                    label = getString(R.string.ai_record_detail_response_section),
+                    text = payload
+                )
+            }
             .show()
+    }
+
+    /**
+     * 把记录的全部上下文（含标题、时间戳、prompt、response、诊断、记录简述）拼成一段方便
+     * 用户直接发回反馈给开发者排查的纯文本。**带 markdown 三反引号块**，让粘贴到聊天里可读。
+     */
+    private fun buildAiTraceCopyText(record: VoiceCommandRecord): String {
+        return buildString {
+            appendLine("== AutoTask AI 调用详情 ==")
+            appendLine("时间: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(record.timestamp))}")
+            appendLine("标题: ${record.title}")
+            record.detail?.takeIf { it.isNotBlank() }?.let {
+                appendLine("简述: $it")
+            }
+            appendLine()
+            appendLine("--- prompt ---")
+            appendLine(record.prompt?.takeIf { it.isNotBlank() } ?: "(无)")
+            appendLine()
+            appendLine("--- raw response ---")
+            appendLine(record.rawResponse?.takeIf { it.isNotBlank() } ?: "(无)")
+            if (!record.diagnostic.isNullOrBlank()) {
+                appendLine()
+                appendLine("--- diagnostic ---")
+                appendLine(record.diagnostic)
+            }
+        }.trimEnd()
+    }
+
+    private fun copyToClipboard(label: String, text: String) {
+        val cm = requireContext().getSystemService(android.content.ClipboardManager::class.java)
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+        toast(R.string.ai_record_detail_copied)
     }
 
     private inner class VoiceCommandRecordAdapter :
