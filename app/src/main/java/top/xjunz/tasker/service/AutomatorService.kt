@@ -62,6 +62,34 @@ interface AutomatorService {
      */
     fun captureUiSnapshotJson(maxNodes: Int, maxTextLen: Int): String
 
+    /**
+     * AI agent 「按 target 描述执行单步动作」的就地组装入口（详见 aidoc/17）。
+     *
+     * 抽象方法：两端都执行同一段 KISS 流程：
+     * 1. 拿当前焦点窗口 root（uiAutomation.rootInActiveWindow）
+     * 2. 用 target 弱字段（viewId/textEquals/contentDescEquals/className）做 findFirst 找到真节点
+     * 3. 调 [top.xjunz.tasker.task.inspector.shared.NodeCriteriaExtractor.extract] 抽出**完整 11+ 字段**的 criteria
+     * 4. 用 [top.xjunz.tasker.task.inspector.shared.NodeToActionAssembler.wrapAsContainsUiObject] 包成 flow，
+     *    在 flow 头部加 isCertainApp(node.packageName) 限定包名
+     * 5. 加对应 action（click / longClick / setText）
+     * 6. 通过 [top.xjunz.tasker.task.runtime.PrivilegedTaskManager] 注册 + 内部 oneshot scheduler 跑
+     * 7. callback 真实回报 task isSuccessful
+     *
+     * 这条路径 100% 复用 inspector「挑节点 → 自动点击/输入」已 work 的链路，
+     * 替代主进程在 [top.xjunz.tasker.ai.translator.AiActionToTask] 里**残缺**抽 criteria 的旧实现。
+     *
+     * @param actionType 1=click / 2=longClick / 3=setText
+     * @param targetJson 序列化的 [top.xjunz.tasker.ai.agent.AiUiTarget]
+     * @param extraText  仅 setText 用，其余传 null
+     */
+    fun executeAgentActionByTarget(
+        actionType: Int,
+        targetJson: String,
+        // 兼容 AIDL non-null String 约束：调用方对"无 text 类动作"传 ""。service 端按 isEmpty 当 null。
+        extraText: String,
+        callback: ITaskCompletionCallback
+    )
+
     fun scheduleOneshotTask(task: XTask, onCompletion: ITaskCompletionCallback)
 
     fun stopOneshotTask(task: XTask)

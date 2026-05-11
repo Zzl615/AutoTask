@@ -269,6 +269,23 @@ class A11yAutomatorService : AccessibilityService(), AutomatorService, IUiAutoma
         task.halt(true)
     }
 
+    override fun executeAgentActionByTarget(
+        actionType: Int,
+        targetJson: String,
+        extraText: String,
+        callback: ITaskCompletionCallback
+    ) {
+        AgentActionDispatcher.dispatch(
+            actionType = actionType,
+            targetJson = targetJson,
+            // 空字符串 = 调用方"没传 text"（详见 AIDL 注释）
+            extraText = extraText.takeIf { it.isNotEmpty() },
+            scheduler = ::scheduleOneshotTask,
+            captureRoot = { runCatching { rootInActiveWindow }.getOrNull() },
+            callback = callback
+        )
+    }
+
     override fun onInterrupt() {
 
     }

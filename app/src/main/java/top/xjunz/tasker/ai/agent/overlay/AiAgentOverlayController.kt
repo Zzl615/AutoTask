@@ -69,7 +69,13 @@ class AiAgentOverlayController(private val service: Service) {
 
     fun isAvailable(): Boolean = Settings.canDrawOverlays(service)
 
-    /** 把决策卡片挂到屏幕上，初始隐藏（只在 [requestDecision] 时显示内容）。 */
+    /**
+     * 把决策卡片挂到屏幕上**并立即可见**——常驻显示"AI agent 已启动，准备读屏..."这种状态文案，
+     * 让用户随时看到 agent 在做什么。
+     *
+     * 历史 bug：之前 show 完 `visibility = GONE`，决策完之后又 GONE，session 整段过程
+     * 用户看不到任何状态，AI 死循环 / 等 8s timeout 都不知情。改成全程常驻可见。
+     */
     fun show() {
         if (!isAvailable()) {
             AiAgentLog.w("overlay", "SYSTEM_ALERT_WINDOW 未授权，跳过 overlay")
@@ -80,12 +86,24 @@ class AiAgentOverlayController(private val service: Service) {
             try {
                 card = DecisionCard(service).also {
                     windowManager.addView(it.root, it.layoutParams)
-                    it.root.visibility = View.GONE
+                    it.root.visibility = View.VISIBLE
+                    it.showIdlePlaceholder()
                 }
                 AiAgentLog.i("overlay", "决策面板已挂上 windowManager")
             } catch (t: Throwable) {
                 AiAgentLog.e("overlay", "挂决策面板失败：${t.message}", t)
             }
+        }
+    }
+
+    /**
+     * Session 实时反馈用——AI 思考中 / 执行中 / 等待中 等状态都通过这里显示在面板顶部。
+     * 在决策面板可见状态下安全调用：决策按钮在等用户点时不会被覆盖（status 显示在 actionView 下方）。
+     */
+    fun showStatus(statusText: String, progressDoneSteps: Int = -1, progressMaxSteps: Int = -1) {
+        if (!isAvailable() || card == null) return
+        mainHandler.post {
+            card?.showStatus(statusText, progressDoneSteps, progressMaxSteps)
         }
     }
 
@@ -130,18 +148,19 @@ class AiAgentOverlayController(private val service: Service) {
                 onApprove = {
                     deferred.complete(AiAgentDecision.ApprovedManual)
                     countdownJob?.cancel()
-                    c.root.visibility = View.GONE
+                    // **不再 GONE**——面板常驻；session 会通过 [showStatus] 切换到"执行中..."文案
+                    c.showExecutingPlaceholder()
                 },
                 onTerminate = {
                     deferred.complete(AiAgentDecision.Terminate("用户主动终止"))
                     countdownJob?.cancel()
-                    c.root.visibility = View.GONE
+                    c.showExecutingPlaceholder()
                 },
                 onPickAnother = {
                     if (snapshot == null) {
                         deferred.complete(AiAgentDecision.Terminate("无快照可换，用户取消"))
                         countdownJob?.cancel()
-                        c.root.visibility = View.GONE
+                        c.showExecutingPlaceholder()
                         return@bind
                     }
                     countdownJob?.cancel()
@@ -154,7 +173,7 @@ class AiAgentOverlayController(private val service: Service) {
                             // 这里简化：直接 Skipped 让 session 把当前 action 当默认通过
                             deferred.complete(AiAgentDecision.Skipped)
                         }
-                        c.root.visibility = View.GONE
+                        c.showExecutingPlaceholder()
                     }
                 }
             )
@@ -385,7 +404,28 @@ class AiAgentOverlayController(private val service: Service) {
         private val pickAnotherBtn = Button(service).apply { text = "换一个" }
         private val candidatesContainer = LinearLayout(service).apply {
             orientation = LinearLayout.VERTICAL
+            // 注意：visibility 由外层 [candidatesScroll] 控制；本 LinearLayout 始终 VISIBLE，
+            // 否则即使 ScrollView 显示，里面的 LinearLayout 是 GONE 子 view 也看不到（已被坑过一次）。
+        }
+        // 候选列表外套滚动容器——deepseek/微信 这种屏幕节点超过 10+ 时一屏放不下，必须能滑。
+        // 高度限制为屏幕 50%，避免决策面板把整个屏幕都占了。
+        private val candidatesScroll = android.widget.ScrollView(service).apply {
             visibility = View.GONE
+            isFillViewport = false
+            addView(
+                candidatesContainer,
+                ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
+        // 按钮行单独提到字段层级——决策中显示，执行中 / 思考中隐藏，让面板状态机一目了然。
+        private val btnRow = LinearLayout(service).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(approveBtn, btnLp(weight = 1f))
+            addView(terminateBtn, btnLp(weight = 1f, leftPx = 8))
+            addView(pickAnotherBtn, btnLp(weight = 1f, leftPx = 8))
         }
 
         val root: LinearLayout = LinearLayout(service).apply {
@@ -401,15 +441,66 @@ class AiAgentOverlayController(private val service: Service) {
             addView(thoughtView, marginParams(topPx = 4))
             addView(progressView, marginParams(topPx = 12, heightPx = 6))
             addView(countdownLabel, marginParams(topPx = 4))
-            val btnRow = LinearLayout(service).apply {
-                orientation = LinearLayout.HORIZONTAL
-                addView(approveBtn, btnLp(weight = 1f))
-                addView(terminateBtn, btnLp(weight = 1f, leftPx = 8))
-                addView(pickAnotherBtn, btnLp(weight = 1f, leftPx = 8))
-            }
             addView(btnRow, marginParams(topPx = 10))
-            addView(candidatesContainer, marginParams(topPx = 10))
+            // 候选区高度上限 = 屏幕 50%，超过自动滚
+            val maxCandidatesHeight = (service.resources.displayMetrics.heightPixels * 0.50f).toInt()
+            addView(
+                candidatesScroll,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    maxCandidatesHeight
+                ).apply { topMargin = 10 }
+            )
             setOnTouchListener(makeDragListener())
+        }
+
+        /**
+         * 初始挂上面板时显示——session 还没开始执行 / 还在等第一帧 snapshot。
+         * 跟 [showStatus] 的差别：状态文案是固定的"启动中"，不带步数。
+         */
+        fun showIdlePlaceholder() {
+            titleView.text = "AI Agent · 启动中"
+            actionView.text = "正在准备读屏 + 等 AI 给出第一步动作..."
+            locationView.visibility = View.GONE
+            thoughtView.visibility = View.GONE
+            progressView.visibility = View.GONE
+            countdownLabel.visibility = View.GONE
+            btnRow.visibility = View.GONE
+            candidatesScroll.visibility = View.GONE
+        }
+
+        /**
+         * 用户决策完后立刻进入这个状态——按钮行 GONE，actionView 换成"正在执行..."占位，
+         * 倒计时文案隐藏。后续 session 会通过 [showStatus] 把更具体的"执行中：xxx"覆盖上来。
+         */
+        fun showExecutingPlaceholder() {
+            actionView.text = "AI 正在执行刚才同意的动作..."
+            locationView.visibility = View.GONE
+            thoughtView.visibility = View.GONE
+            progressView.visibility = View.GONE
+            countdownLabel.visibility = View.GONE
+            btnRow.visibility = View.GONE
+            candidatesScroll.visibility = View.GONE
+        }
+
+        /**
+         * Session 实时调用——显示"AI 思考下一步中..." / "正在执行：点击 xxx" / "已完成第 N 步"等。
+         *
+         * @param progressDoneSteps 已用步数（< 0 表示不显示进度）
+         * @param progressMaxSteps  上限步数
+         */
+        fun showStatus(statusText: String, progressDoneSteps: Int, progressMaxSteps: Int) {
+            if (progressDoneSteps >= 0 && progressMaxSteps > 0) {
+                titleView.text = "AI Agent · 第 ${progressDoneSteps + 1} / $progressMaxSteps 步"
+            }
+            actionView.text = statusText
+            // 思考 / 执行状态下隐藏决策细节；下次 bind 决策时再显示
+            locationView.visibility = View.GONE
+            thoughtView.visibility = View.GONE
+            progressView.visibility = View.GONE
+            countdownLabel.visibility = View.GONE
+            btnRow.visibility = View.GONE
+            candidatesScroll.visibility = View.GONE
         }
 
         val layoutParams: WindowManager.LayoutParams =
@@ -463,6 +554,10 @@ class AiAgentOverlayController(private val service: Service) {
         ) {
             titleView.text = "AI Agent · 第 ${stepIndex + 1} 步"
             actionView.text = describeAction(action)
+            // 上一次决策完进入了 executing/status 状态把这些 GONE 了，本次重新决策时**恢复可见**
+            progressView.visibility = View.VISIBLE
+            countdownLabel.visibility = View.VISIBLE
+            btnRow.visibility = View.VISIBLE
 
             // 位置行：优先显示**预匹配命中**节点的实际 bounds（最准）；
             // 没匹中（target 在当前快照里找不到）就提示用户"屏幕上没找到目标"——
@@ -477,7 +572,7 @@ class AiAgentOverlayController(private val service: Service) {
             thoughtView.text = action.thought?.let { "思考：$it" }.orEmpty()
             thoughtView.visibility = if (thoughtView.text.isNullOrBlank()) View.GONE else View.VISIBLE
             candidatesContainer.removeAllViews()
-            candidatesContainer.visibility = View.GONE
+            candidatesScroll.visibility = View.GONE
             approveBtn.setOnClickListener { onApprove() }
             terminateBtn.setOnClickListener { onTerminate() }
             pickAnotherBtn.visibility = if (allowReplace && actionHasTarget(action)) View.VISIBLE else View.GONE
@@ -505,10 +600,14 @@ class AiAgentOverlayController(private val service: Service) {
             scope: CoroutineScope,
             onPicked: (newTarget: top.xjunz.tasker.ai.agent.AiUiTarget?, hint: String?) -> Unit
         ) {
+            // **不截断**——把所有"对人有意义"的节点都列出来（candidate row 自带滚动容器，详见
+            // candidatesContainer 父级 ScrollView 设置）。用户反馈过 top-N 截断会漏掉关键节点
+            // （比如 deepseek 启动屏底部 "发消息或按住说话" TextView 在第 9 个），让"换一个"形同虚设。
+            // shortlist 内部按相似度 + 屏幕位置排序，靠前的都更可能是用户想要的。
             val candidates = CandidateListPicker.shortlist(
                 snapshot,
                 originalTarget(action),
-                topN = 8
+                topN = Int.MAX_VALUE
             )
             // log 出实际呈现给用户的候选列表，便于诊断"用户说不知所云"——
             // 我们能知道排序后到底是哪些节点上桌
@@ -525,7 +624,7 @@ class AiAgentOverlayController(private val service: Service) {
                     textSize = 12f
                 })
                 candidatesContainer.addView(buildCancelButton(onPicked))
-                candidatesContainer.visibility = View.VISIBLE
+                candidatesScroll.visibility = View.VISIBLE
                 return
             }
             candidatesContainer.removeAllViews()
@@ -540,7 +639,7 @@ class AiAgentOverlayController(private val service: Service) {
                 candidatesContainer.addView(row, marginParams(topPx = 4))
             }
             candidatesContainer.addView(buildCancelButton(onPicked), marginParams(topPx = 8))
-            candidatesContainer.visibility = View.VISIBLE
+            candidatesScroll.visibility = View.VISIBLE
 
             // 关键交互：候选 container 接管 touch 事件，按下 / 滑动到哪个 row 就预览高亮哪个节点；
             // 松手在该 row 上才"真选中"。这避免了用户只能盲选的问题——他能边看屏幕红框边挑。
@@ -614,11 +713,14 @@ class AiAgentOverlayController(private val service: Service) {
             // 注意：DOWN 阶段判断 y 是否落在候选 row 区间内——只有在区间内才返回 true 拦截，
             // 否则返回 false 让事件继续传给 child（取消按钮 / 提示 TextView 的 OnClickListener）。
             // 一旦 DOWN 返回 true，后续 MOVE/UP 都会走这里，child 的 click 不会再触发。
-            candidatesContainer.setOnTouchListener { _, ev ->
+            candidatesContainer.setOnTouchListener { v, ev ->
                 val hit = hitTestRow(ev.y)
                 when (ev.action) {
                     MotionEvent.ACTION_DOWN -> {
                         if (hit < 0) return@setOnTouchListener false  // 让事件走 child
+                        // 关键：禁止外层 ScrollView 拦截后续 MOVE/UP（否则上下滑会触发滚动 → 收到 CANCEL）。
+                        // 用户的"按住预览 → 滑到另一行 → 切换高亮"全靠这里。
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
                         applyBg(hit, hovered = true)
                         val node = candidates[hit - candidateStartIdx]
                         highlightBounds(node.bounds, holdMillis = -1)

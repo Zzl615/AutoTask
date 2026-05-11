@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import top.xjunz.tasker.BuildConfig
+import top.xjunz.tasker.ai.AiJson
 import top.xjunz.tasker.ai.translator.AiActionToTask
 import top.xjunz.tasker.app
 import top.xjunz.tasker.engine.applet.base.Applet
@@ -24,6 +25,7 @@ import top.xjunz.tasker.service.serviceController
 import top.xjunz.tasker.task.applet.option.AppletOptionFactory
 import top.xjunz.tasker.task.applet.option.registry.BootstrapOptionRegistry
 import top.xjunz.tasker.task.applet.option.registry.ShellCmdActionRegistry
+import top.xjunz.tasker.task.inspector.shared.AiAgentTaskAssembler
 import top.xjunz.tasker.task.runtime.ITaskCompletionCallback
 import top.xjunz.tasker.task.runtime.LocalTaskManager
 
@@ -73,12 +75,23 @@ object AiAgentExecutor {
                 message = "scroll 暂未通过 task 管道实现，请用 click 或 wait 替代"
             )
 
+            // **新链路（aidoc/17）**：click / longClick 走 RPC `executeAgentActionByTarget`，
+            // 让执行端进程拿真节点 + NodeCriteriaExtractor 抽完整 criteria，跟 inspector「自动点击」字段级一致。
+            is AiAgentAction.Click -> dispatchAgentActionByTarget(
+                AiAgentTaskAssembler.ACTION_CLICK, action.target, null,
+                actionLabel = "click"
+            )
+            is AiAgentAction.LongClick -> dispatchAgentActionByTarget(
+                AiAgentTaskAssembler.ACTION_LONG_CLICK, action.target, null,
+                actionLabel = "long_click"
+            )
             is AiAgentAction.SetText -> setTextWithFallback(action)
 
             is AiAgentAction.Done,
             is AiAgentAction.GiveUp,
             is AiAgentAction.Unknown -> AiAgentStepResult(ok = true, message = "no-op")
 
+            // GlobalBack / GlobalHome 不依赖节点匹配，仍走旧 task 管道（AiActionToTask）
             else -> dispatchViaTask(action)
         }
         AiAgentLog.i(
@@ -87,6 +100,67 @@ object AiAgentExecutor {
                     (result.message?.let { " | $it" } ?: "")
         )
         return result
+    }
+
+    /**
+     * 通过 [AutomatorService.executeAgentActionByTarget] 跨进程派发动作（aidoc/17 KISS 重构）。
+     *
+     * 流程：
+     * 1. 把 AI target 序列化成 JSON
+     * 2. 调 service RPC：执行端进程拿到 root → BFS 找节点 → NodeCriteriaExtractor 抽**完整 criteria**
+     *    → 包成 inspector 同款 task → 跑 → callback 真实回报成败
+     * 3. callback 回 false 通常意味着：当前屏幕找不到匹中 target 的节点 / criteria 太严没命中 /
+     *    节点 perform 真失败（极少；inspector 已 work 链路）
+     *
+     * 失败 / 超时映射成 [AiAgentStepResult]，message 给 AI 在下一轮 prompt 看。
+     */
+    private suspend fun dispatchAgentActionByTarget(
+        actionType: Int,
+        target: AiUiTarget,
+        extraText: String?,
+        actionLabel: String
+    ): AiAgentStepResult {
+        if (!serviceController.isServiceRunning) {
+            return AiAgentStepResult(
+                ok = false,
+                message = "AutoTask 服务未启动，无法执行节点动作。请去 AutoTask 主页『启动服务』后重试。"
+            )
+        }
+        val targetJson = runCatching {
+            AiJson.encodeToString(AiUiTarget.serializer(), target)
+        }.getOrElse {
+            return AiAgentStepResult(ok = false, message = "target 序列化失败：${it.message}")
+        }
+
+        val deferred = CompletableDeferred<Boolean>()
+        runCatching {
+            currentService.executeAgentActionByTarget(
+                actionType, targetJson,
+                // AIDL non-null 约束：click/longClick 这种没 text 的传 ""，service 端按 isEmpty 当 null。
+                extraText ?: "",
+                object : ITaskCompletionCallback.Stub() {
+                    override fun onTaskCompleted(isSuccessful: Boolean) {
+                        deferred.complete(isSuccessful)
+                    }
+                }
+            )
+        }.onFailure {
+            deferred.complete(false)
+            AiAgentLog.e("execute.$actionLabel", "RPC 调用异常：${it.message}", it)
+            return AiAgentStepResult(ok = false, message = "agent 动作 RPC 异常：${it.message}")
+        }
+        val ok = withTimeoutOrNull(SCHEDULE_TIMEOUT_MILLIS) { deferred.await() }
+        return when (ok) {
+            null -> AiAgentStepResult(
+                ok = false,
+                message = "等待执行完成超时（${SCHEDULE_TIMEOUT_MILLIS}ms），可能远端卡死，请下一步 wait 或 give_up"
+            )
+            true -> AiAgentStepResult(ok = true, message = "${actionLabel} 命中节点并执行完成")
+            false -> AiAgentStepResult(
+                ok = false,
+                message = "${actionLabel} 未在当前屏幕找到匹中 target 的节点（target 字段太宽 / 此页面没有该控件 / 节点拒绝 perform）"
+            )
+        }
     }
 
     /**
@@ -105,23 +179,28 @@ object AiAgentExecutor {
      * AI 在下一轮 prompt 里能看到"a11y SET_TEXT 失败，已 fallback 到剪贴板粘贴成功" 之类的故事。
      */
     private suspend fun setTextWithFallback(action: AiAgentAction.SetText): AiAgentStepResult {
-        // 第一层：原 task 管道（a11y SET_TEXT），普通 EditText 一发命中
-        val first = dispatchViaTask(action)
-        // **关键修法**：a11y SET_TEXT 在 deepseek/RN 等自绘控件上**系统层返回 true 但实际没写入**——
+        // 第一层：走新 RPC `executeAgentActionByTarget`（aidoc/17）——执行端进程拿真节点 +
+        // NodeCriteriaExtractor 抽完整 criteria + 包成 inspector 同款 task + 跑 setText action。
+        // 普通 native EditText 一发命中。
+        val first = dispatchAgentActionByTarget(
+            AiAgentTaskAssembler.ACTION_SET_TEXT, action.target, action.text,
+            actionLabel = "set_text"
+        )
+        // **关键**：a11y SET_TEXT 在 deepseek/RN 等自绘控件上**系统层返回 true 但实际没写入**——
         // 这种 silent fail 是 Android 框架的已知陷阱，task callback 完全无法识别。
         // 必须执行后立刻抓一次 snapshot 验证 EditText.text 是否真的包含我们的输入，
         // 没有就直接走 paste fallback；不能等下一轮 session loop 的 silent-fail 检测（那时 fallback 已晚）。
         if (first.ok) {
             delay(250)  // 给 UI 反应时间
             if (verifyTextWritten(action)) {
-                return first.copy(message = "a11y SET_TEXT 成功（验证 EditText 已包含输入文字）")
+                return first.copy(message = "set_text 成功（验证 EditText 已包含输入文字）")
             }
             AiAgentLog.w(
                 "execute.setText",
                 "a11y SET_TEXT 系统层返回 true 但屏幕 EditText 实际未写入文字（silent fail）；启动 paste fallback"
             )
         } else {
-            AiAgentLog.w("execute.setText", "a11y SET_TEXT 失败，启动剪贴板+PASTE fallback：${first.message}")
+            AiAgentLog.w("execute.setText", "set_text 失败，启动剪贴板+PASTE fallback：${first.message}")
         }
 
         // 第二层：剪贴板 + KEYCODE_PASTE
@@ -138,7 +217,9 @@ object AiAgentExecutor {
             )
         }
         // 先 click 节点让它聚焦——KEYCODE_PASTE 需要焦点在 EditText 上才会触发输入法粘贴
-        val focusClick = dispatchViaTask(AiAgentAction.Click(target = action.target, thought = "聚焦输入框为 PASTE 准备"))
+        val focusClick = dispatchAgentActionByTarget(
+            AiAgentTaskAssembler.ACTION_CLICK, action.target, null, actionLabel = "set_text.focusClick"
+        )
         if (!focusClick.ok) {
             return AiAgentStepResult(
                 ok = false,

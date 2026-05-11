@@ -47,6 +47,29 @@ interface IRemoteAutomatorService {
      */
     String captureUiSnapshotJson(int maxNodes, int maxTextLen) = 17;
 
+    /**
+     * AI agent 「按 target 描述执行单步动作」的就地组装入口（见 aidoc/17）。
+     *
+     * 跟 [scheduleOneshotTask] 的差别：[scheduleOneshotTask] 要求调用方把整棵 task 树先在
+     * 主进程组好，但 AI agent 只持有 [AiUiTarget] 弱字段定位，主进程拿不到真节点，**没法**
+     * 抽出跟 inspector 自动点击同款的完整 criteria（11+ 字段），命中范围太宽屡屡误命中。
+     *
+     * 此方法把"target → 真节点 → NodeCriteriaExtractor 抽完整 criteria → 包成 task → 跑"
+     * 整段挪到执行端进程内部完成，复用 inspector 已 work 的链路，AI agent 跟 inspector 真正等价。
+     *
+     * 参数：
+     * - actionType：1=click / 2=longClick / 3=setText
+     * - targetJson：序列化的 AiUiTarget（含 viewId/textEquals/contentDescEquals/className 等弱字段）
+     * - extraText：仅 setText 用，其他类型传 null
+     * - callback：执行完成回调，isSuccessful 真实反映 task 树是否跑通（命中节点 + perform 成功）
+     */
+    /**
+     * extraText：仅 setText 用；click / longClick 等无文本动作传**空字符串**而非 null
+     * （AIDL `@nullable` 在 Shizuku binder 路径 + 旧 Kotlin override 上兼容性差，传空字符串最稳）。
+     * service 端用 `extraText.takeIf { it.isNotEmpty() }` 当 null 处理。
+     */
+    void executeAgentActionByTarget(int actionType, String targetJson, String extraText, in ITaskCompletionCallback callback) = 18;
+
     oneway void destroy() = 16777114; // Destroy method defined by Shizuku server
 
 }

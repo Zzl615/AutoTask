@@ -172,6 +172,34 @@ class ShizukuAutomatorService : IRemoteAutomatorService.Stub, AutomatorService {
         delegate.scheduleOneshotTask(task.checksum, onCompletion)
     }
 
+    /**
+     * AI agent 动作派发（aidoc/17）：一律转给特权进程在它本地拿 root + 抽 criteria + 跑 task。
+     * 主进程不参与 task 组装——只主进程拿不到 AccessibilityNodeInfo 是这条路径存在的根本原因。
+     */
+    @Local
+    @Privileged
+    override fun executeAgentActionByTarget(
+        actionType: Int,
+        targetJson: String,
+        extraText: String,
+        callback: ITaskCompletionCallback
+    ) {
+        if (isAppProcess) {
+            // 跨进程仍传 String（非空），AIDL non-null 约束方便兼容
+            delegate.executeAgentActionByTarget(actionType, targetJson, extraText, callback)
+            return
+        }
+        ensurePrivilegedProcess()
+        AgentActionDispatcher.dispatch(
+            actionType = actionType,
+            targetJson = targetJson,
+            extraText = extraText.takeIf { it.isNotEmpty() },  // 空字符串当 null
+            scheduler = { task, cb -> oneshotTaskScheduler.scheduleTask(task, cb) },
+            captureRoot = { runCatching { uiAutomation.rootInActiveWindow }.getOrNull() },
+            callback = callback
+        )
+    }
+
     @Privileged
     override fun stopOneshotTask(id: Long) {
         PrivilegedTaskManager.requireTask(id).halt(true)

@@ -26,6 +26,8 @@ import top.xjunz.tasker.task.inspector.shared.UiTreeQuery
  *
  * Session 自己不创建协程，调用方负责 launch；这样 cancel / 生命周期管理留给上层。
  */
+private const val OUT_OF_SCOPE_TOLERATE_HITS = 3
+
 class AiAgentSession(
     val scope: AiTaskScope,
     /**
@@ -89,6 +91,16 @@ class AiAgentSession(
     private var consecutiveAiErrors = 0
 
     /**
+     * 连续观测到 "pkg 不在授权范围且看上去像 launcher 过场" 的次数。
+     * 累计 ≥ [OUT_OF_SCOPE_TOLERATE_HITS] 才真终止。
+     *
+     * 真实场景：vivo OriginOS 的 launcher 包名 `com.bbk.launcher2` 漏列了一段时间，
+     * 还有不少第三方桌面 / 过场动画 App 没法穷举。下次 launch_app 之后碰到一帧过场就立刻
+     * outOfScope 终止过于激进——给个 N 轮宽容窗口，等下一帧反弹回目标 App 再继续。
+     */
+    private var consecutiveOutOfScopeHits = 0
+
+    /**
      * 进入循环；返回值与最后一次 [Callbacks.onComplete] 一致，方便调用方就地拿到结果。
      */
     suspend fun run(): AiAgentSessionOutcome = coroutineScope {
@@ -128,6 +140,7 @@ class AiAgentSession(
             }
 
             // ---- 抓快照 ----
+            overlay?.showStatus("正在读取屏幕节点...", stepIndex, scope.maxSteps)
             val snapshot = ScreenSnapshotProvider.capture()
             val pkg = snapshot?.packageName
             val currentSig = snapshot?.let { computeSnapshotSignature(it) }
@@ -184,16 +197,42 @@ class AiAgentSession(
             // ---- App scope 检查 ----
             // 第一步前 App 还没启动是正常的（AI 可能要先 launch_app），允许 snapshot 为 null 或 在桌面/launcher。
             // 但一旦 history 里已经有 launch_app 成功后，AI 又跑去其他 App，立刻停下。
-            if (pkg != null && history.isNotEmpty() && !scope.coversApp(pkg) && !isLauncherOrSystem(pkg)) {
-                AiAgentLog.w("session.outOfScope", "当前包 $pkg 不在授权 ${scope.targetApps} 内，停止")
-                return AiAgentSessionOutcome.OutOfScope(
-                    history = history.toList(),
-                    currentPackage = pkg
-                )
+            if (pkg != null && history.isNotEmpty() && !scope.coversApp(pkg)) {
+                if (isLauncherOrSystem(pkg)) {
+                    // 已知的 launcher / 系统过场，正常容忍，重置计数
+                    consecutiveOutOfScopeHits = 0
+                } else {
+                    // 未知第三方过场：累计 N 次后才真终止，给 OEM 闪屏 / 反弹回目标 App 留窗口
+                    consecutiveOutOfScopeHits++
+                    if (consecutiveOutOfScopeHits < OUT_OF_SCOPE_TOLERATE_HITS) {
+                        AiAgentLog.w(
+                            "session.outOfScopeTolerate",
+                            "当前包 $pkg 不在授权 ${scope.targetApps} 内，但还在反弹宽容窗口" +
+                                    "（${consecutiveOutOfScopeHits}/$OUT_OF_SCOPE_TOLERATE_HITS），等下一轮再看"
+                        )
+                        delay(400)
+                        continue
+                    }
+                    AiAgentLog.w(
+                        "session.outOfScope",
+                        "当前包 $pkg 不在授权 ${scope.targetApps} 内，连续 $consecutiveOutOfScopeHits 次确认，停止"
+                    )
+                    return AiAgentSessionOutcome.OutOfScope(
+                        history = history.toList(),
+                        currentPackage = pkg
+                    )
+                }
+            } else {
+                // 包名 OK / snapshot 空 / 第一步前 → 正常状态，重置计数
+                consecutiveOutOfScopeHits = 0
             }
 
             // ---- 问 AI ----
             callbacks.onThinking(stepIndex)
+            overlay?.showStatus(
+                "AI 正在规划第 ${stepIndex + 1} 步动作（最多等 ${Preferences.aiRequestTimeoutMillis / 1000}s）...",
+                stepIndex, scope.maxSteps
+            )
             val deadList = pkg?.let { deadTargetsByPkg[it]?.toList() }.orEmpty()
             val nextResult = AiAgentPlanner.nextAction(
                 userGoal = scope.userGoal,
@@ -361,7 +400,21 @@ class AiAgentSession(
             }
 
             // ---- 执行 ----
+            // 状态文案给具体动作 + AI 的 thought（让用户随时知道 AI 在干嘛、为什么这么做）
+            val thoughtTail = executedAction.thought?.takeIf { it.isNotBlank() }
+                ?.let { "（${it.take(40)}）" }.orEmpty()
+            overlay?.showStatus(
+                "正在执行：${describeActionShort(executedAction)}$thoughtTail",
+                stepIndex, scope.maxSteps
+            )
             val result = AiAgentExecutor.execute(executedAction)
+            // 执行完后把结果立刻反馈到面板上——OK / FAIL + 简短消息，让用户知道这一步成败
+            val resultTail = if (result.ok) "✓" else "✗"
+            val resultMsg = result.message?.take(60) ?: ""
+            overlay?.showStatus(
+                "已完成：$resultTail ${describeActionShort(executedAction)}\n$resultMsg",
+                stepIndex, scope.maxSteps
+            )
             val record = AiAgentStepRecord(
                 index = stepIndex,
                 action = executedAction,
@@ -475,6 +528,24 @@ class AiAgentSession(
     }
 
     /**
+     * 给状态栏面板用的极简动作描述——一行就能放下。
+     * 不调 [AiAgentOverlayController] 的 humanizeTarget，避免循环依赖；保持自己的轻量映射。
+     */
+    private fun describeActionShort(action: AiAgentAction): String = when (action) {
+        is AiAgentAction.LaunchApp -> "启动 ${action.packageName}"
+        is AiAgentAction.Click -> "点击 ${formatTargetForLog(action.target)}"
+        is AiAgentAction.LongClick -> "长按 ${formatTargetForLog(action.target)}"
+        is AiAgentAction.SetText -> "输入「${action.text.take(20)}」到 ${formatTargetForLog(action.target)}"
+        is AiAgentAction.Scroll -> "滚动 ${action.direction}"
+        is AiAgentAction.Wait -> "等待 ${action.seconds}s"
+        is AiAgentAction.GlobalBack -> "返回上一级"
+        is AiAgentAction.GlobalHome -> "回到桌面"
+        is AiAgentAction.Done -> "完成：${action.summary.take(40)}"
+        is AiAgentAction.GiveUp -> "放弃：${action.reason.take(40)}"
+        is AiAgentAction.Unknown -> "未识别"
+    }
+
+    /**
      * 该动作"按理"应该改变屏幕（点击 / 输入 / 滚动 / 返回 / 启动 App）。
      * 仅这些动作执行后屏幕没变化才报 silent-fail；wait 等等动作本就不改变屏幕，不算问题。
      */
@@ -513,6 +584,10 @@ class AiAgentSession(
 
 /**
  * 一些常见的"过场"包名，在 launch_app 之后短暂出现，不算"切到其他 App"。
+ *
+ * 注：很多 OEM 把 launcher 包名换成自己的（vivo `com.bbk.launcher2` 不带 launcher 子串、
+ * 小米 `com.miui.home` 等），所以下面 [isLauncherOrSystem] 除了硬列名单还做后缀启发，
+ * 仍然兜底不住时由 [AiAgentSession] 的"launcher 反弹宽容"机制再给 N 轮机会。
  */
 private val LAUNCHER_OR_SYSTEM = setOf(
     "com.android.systemui",
@@ -522,13 +597,19 @@ private val LAUNCHER_OR_SYSTEM = setOf(
     "com.huawei.android.launcher",
     "com.oppo.launcher",
     "com.vivo.launcher",
+    "com.bbk.launcher2",                       // vivo OriginOS 真实 launcher 包名
+    "com.bbk.launcher",
     "com.sec.android.app.launcher",
     "com.google.android.apps.nexuslauncher",
+    "com.realme.launcher",
+    "com.honor.launcher",
+    "com.transsion.hilauncher",
     "android"
 )
 
 private fun isLauncherOrSystem(pkg: String): Boolean = pkg in LAUNCHER_OR_SYSTEM ||
-        pkg.endsWith(".launcher") || pkg.endsWith(".launcher3")
+        pkg.endsWith(".launcher") || pkg.endsWith(".launcher3") ||
+        pkg.endsWith(".launcher2") || pkg.endsWith(".home") || pkg.endsWith(".systemui")
 
 private fun AiAgentAction.requiredCapability(): top.xjunz.tasker.ai.model.AiCapability? = when (this) {
     is AiAgentAction.LaunchApp -> top.xjunz.tasker.ai.model.AiCapability.LaunchIntent
