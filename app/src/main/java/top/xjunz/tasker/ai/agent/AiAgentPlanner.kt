@@ -8,7 +8,6 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import top.xjunz.tasker.Preferences
 import top.xjunz.tasker.ai.AiJson
 import top.xjunz.tasker.ai.model.AiCapability
@@ -527,29 +526,6 @@ plan_status 含义：on_track（按规划） / adjusted（小调整） / off_tra
         return if (start >= 0 && end >= start) text.substring(start, end + 1) else text
     }
 
-    /**
-     * 调试用：能把 history 序列化成给人看的字符串，但目前 [buildHistorySection] 已经够用，
-     * 这个保留作为后续扩展接口（例如把整段 history 用 JSON 灌给 prompt）。
-     */
-    @Suppress("unused")
-    fun encodeHistoryForDebug(history: List<AiAgentStepRecord>): String {
-        return AiJson.encodeToString(history.map {
-            AgentHistoryDebugDto(
-                index = it.index,
-                actionType = it.action::class.simpleName.orEmpty(),
-                ok = it.result.ok,
-                message = it.result.message
-            )
-        })
-    }
-
-    @Serializable
-    private data class AgentHistoryDebugDto(
-        val index: Int,
-        val actionType: String,
-        val ok: Boolean,
-        val message: String?
-    )
 }
 
 @Serializable

@@ -17,7 +17,7 @@
    - 设计依据：`16-ai-inspector-capability.md` §13、`14-ai-integration.md` §7.1、`15-ai-working-notes.md` §12。
    - **已不再适用**的旧子任务：原本计划的 Phase 2.A 只读 → 2.B 可执行 → 2.C 写入兜底三段式被合并成一次性 agent loop 闭环，不再分批落地。
    - **后续 follow-up 子任务**（明天起按需推进）：
-     - **2.1 把 agent 跑过的步骤"另存为任务"**：跑完后给 records 卡片加一个"保存为任务"按钮，把 `AiAgentStepRecord` 序列翻译成 `RootFlow + Do + Applet` 走 `FlowEditor`。复用已有的 `AiTaskDraftConverter` + `UiObjectFlowAssembler` 思路。
+     - **2.1 ~~把 agent 跑过的步骤"另存为任务"~~**：**已废弃**（2026-05-13 决策）。agent 任务定位为**独立运行**，每次跑完即丢，不再为"保存为可重放任务"做沉淀；改为通过通知给用户汇报执行结果（任务结束后弹 `ai_agent_outcome` 通知），并规划"经验本"沉淀执行心得让 AI 越来越聪明（见 `aidoc/20-experience-book-design.md`）。原本预留的相关代码（`NodeToActionAssembler` 注释里 follow-up 2.1、`AiAgentStepRecord` 转 XTask 草稿等描述、`AiAgentPlanner.encodeHistoryForDebug` 调试残骸）已一并清理。
      - **2.2 包名校验与用户编辑**：`runAgentFlow` 拿到 `plan.targetAppPackage` 后用 `PackageManagerBridge.loadPackageInfo` 校验存在性；任务级授权对话框允许用户手改包名 / 加多个包。
      - **2.3 中止运行中 session 的 UI 入口**：在记录卡片或浮动 toast 里加"停止 agent"按钮，调用 `coroutineScope.cancel()` 或新增 `AiAgentSession.cancel()`。
      - **2.4 节点压缩 redact**：把 `viewId` 命中 password / cvv / bank / phone / id_card 等关键词的节点的 `text` 强制 `redacted=true`，不上传明文。

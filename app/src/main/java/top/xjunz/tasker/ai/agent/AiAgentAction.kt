@@ -282,7 +282,9 @@ data class AiAgentStepResult(
 )
 
 /**
- * 进入 [AiAgentSession] 历史的一条记录。后续可以全量回放、转成 XTask 草稿。
+ * 进入 [AiAgentSession] 历史的一条记录。在 session 内做"喂回 prompt 给下一轮 AI 看"
+ * 与"语音页 records 卡片实时审计"两件事。**不**用于事后转 XTask 草稿——
+ * agent 任务独立运行，跑完即丢。
  *
  * [userIntervention] 记录"本步用户在决策面板做了什么"。null = 未走决策面板（被禁用 / overlay 不可用 /
  * 此 action 类型不需要确认）。AI 在下一轮会通过 prompt 看到这个标记，进行自我学习。

@@ -787,7 +787,8 @@ private fun AiAgentAction.requiredCapability(): top.xjunz.tasker.ai.model.AiCapa
 }
 
 /**
- * Session 的最终结果。所有分支都带 history，便于上层做"是否保存为任务"等后续处理。
+ * Session 的最终结果。所有分支都带 history 仅用于 outcome 详情展示（语音页 records 卡片）
+ * 和结果通知正文拼装；agent 任务独立运行、跑完即丢，**不**用于反向生成可保存的 XTask 草稿。
  */
 sealed class AiAgentSessionOutcome {
     abstract val history: List<AiAgentStepRecord>

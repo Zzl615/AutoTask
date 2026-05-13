@@ -309,7 +309,7 @@ backend 新增（`app/src/main/java/top/xjunz/tasker/ai/agent/`）：
 
 ### 12.6 已知 follow-up
 
-- agent 跑完没自动"保存为可重放任务"按钮。
+- ~~agent 跑完没自动"保存为可重放任务"按钮~~——2026-05-13 决策：agent 改为独立运行、跑完即丢，**不**再做"保存为任务"。改为通过通知给用户汇报执行结果；执行心得用"经验本"沉淀让 AI 越来越聪明（见 `aidoc/20-experience-book-design.md`）。
 - 节点压缩规则粗暴（80/80），未做敏感字段 redact，先靠 AI 自己 give_up 回避。
 - Plan 阶段完全信任 AI 给出的 `targetAppPackage`；下一轮加包名校验 + 用户改包名入口。
 - 没做"中止运行中 session"的 UI；想停只能停整个语音监听服务。
