@@ -18,8 +18,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
 import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.launch
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import top.xjunz.tasker.R
 import top.xjunz.tasker.ai.agent.experience.AiAgentExperienceBook
@@ -117,16 +119,21 @@ class VoiceCommandFragment : BaseFragment<FragmentVoiceCommandBinding>(), Scroll
     private fun refreshExperienceUsage() {
         if (!isAdded) return
         val ctx = context ?: return
-        val count = AiAgentExperienceBook.queryAll(ctx).size
-        if (count == 0) {
-            binding.tvExperienceUsage.setText(R.string.ai_experience_book_card_usage_empty)
-        } else {
-            val bytes = AiAgentExperienceBook.usageBytes(ctx)
-            binding.tvExperienceUsage.text = getString(
-                R.string.format_ai_experience_book_card_usage,
-                count,
-                formatBytes(bytes)
-            )
+        // suspend API：经验本 IO 走 Dispatchers.IO，结果在主线程更新 TextView
+        viewLifecycleOwner.lifecycleScope.launch {
+            val count = AiAgentExperienceBook.queryAll(ctx).size
+            if (!isAdded) return@launch
+            if (count == 0) {
+                binding.tvExperienceUsage.setText(R.string.ai_experience_book_card_usage_empty)
+            } else {
+                val bytes = AiAgentExperienceBook.usageBytes(ctx)
+                if (!isAdded) return@launch
+                binding.tvExperienceUsage.text = getString(
+                    R.string.format_ai_experience_book_card_usage,
+                    count,
+                    formatBytes(bytes)
+                )
+            }
         }
     }
 

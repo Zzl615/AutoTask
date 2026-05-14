@@ -750,8 +750,10 @@ class VoiceCommandService : Service(), RecognitionListener {
     /**
      * Session 结束后把这次会话的所有信息写入经验本，下一次类似任务可被召回供 AI 参考。
      * 失败不影响主流程（catch 在 [AiAgentExperienceBook.recordSession] 内部）。
+     *
+     * suspend：底层写盘走 Dispatchers.IO，避免阻塞 service main 协程。
      */
-    private fun recordOutcomeToExperienceBook(
+    private suspend fun recordOutcomeToExperienceBook(
         outcome: AiAgentSessionOutcome,
         plan: AiAgentSessionPlan?,
         userGoal: String,

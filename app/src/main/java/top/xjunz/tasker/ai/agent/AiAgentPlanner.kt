@@ -24,6 +24,22 @@ import top.xjunz.tasker.ai.provider.AiProviderFactory
  */
 object AiAgentPlanner {
 
+    // ---------- prompt 注入「📚 经验本」段的字段长度硬上限 ----------
+    /** 单条经验里 userGoal 最长字符数（截断后续）。 */
+    private const val EXP_GOAL_MAX_CHARS = 100
+
+    /** 单条 keyLearning / failureTrap 文本最长字符数。 */
+    private const val EXP_LEARNING_MAX_CHARS = 120
+
+    /** 一条经验里最多展示的 keyLearning 行数（多余的省略）。 */
+    private const val EXP_LEARNINGS_MAX_LINES = 5
+
+    /** 一条经验里最多展示的 failureTrap 行数。 */
+    private const val EXP_TRAPS_MAX_LINES = 5
+
+    /** outcome detail（done / give_up summary）最长字符数。 */
+    private const val EXP_OUTCOME_DETAIL_MAX_CHARS = 140
+
     /**
      * 当前 agent 第一阶段对外开放的能力。模型在 prompt 里被告知只能用这些 type，
      * 任何超出的 type 都会被 [AiAgentAction.fromDto] 兜底成 Unknown。
@@ -300,26 +316,32 @@ $userGoal
             appendLine("**禁止**：再选一遍 deadTargets / failed strategies 里的任何东西，或换 className 但保持 text 不变这种伪'换方向'。")
         }.trimEnd()
         // **跨 session 经验本**：会话开局召回的 top-N 历史经验，给 AI 看以前在类似任务上学到的关键路径 / 已知陷阱
+        // **字段长度硬截断**：避免某条经验里超长 userGoal / learning / detail 把每步 nextAction 的 prompt
+        // 拉长到触发模型 timeout / 超出 context window / 费用上升。每条经验整体大约控制在 700-900 字以内。
         val experienceSection = if (experiences.isEmpty()) "" else buildString {
             appendLine()
             appendLine("📚 你以前在类似任务上的经验（仅供参考；UI 可能已变化，要先用 observation 现场验证）：")
             experiences.forEachIndexed { i, e ->
                 appendLine("--- 经验 ${i + 1}/${experiences.size} ---")
-                val pkg = e.file.targetAppPackage ?: "?"
-                val label = e.file.targetAppLabel?.let { " ($it)" } ?: ""
-                appendLine("【目标】${e.file.userGoal}")
+                val pkg = e.file.targetAppPackage?.take(50) ?: "?"
+                val label = e.file.targetAppLabel?.take(30)?.let { " ($it)" } ?: ""
+                appendLine("【目标】${e.file.userGoal.take(EXP_GOAL_MAX_CHARS)}")
                 appendLine("【App】${pkg}${label}")
-                appendLine("【结果】${e.file.outcome} · ${e.file.outcomeLabel} · 共 ${e.file.steps.size} 步")
+                appendLine("【结果】${e.file.outcome} · ${e.file.outcomeLabel.take(40)} · 共 ${e.file.steps.size} 步")
                 if (e.file.keyLearnings.isNotEmpty()) {
                     appendLine("【关键路径】")
-                    e.file.keyLearnings.take(6).forEach { appendLine("  - $it") }
+                    e.file.keyLearnings.take(EXP_LEARNINGS_MAX_LINES).forEach {
+                        appendLine("  - ${it.take(EXP_LEARNING_MAX_CHARS)}")
+                    }
                 }
                 if (e.file.failureTrapsAvoided.isNotEmpty()) {
                     appendLine("【已知陷阱】")
-                    e.file.failureTrapsAvoided.take(6).forEach { appendLine("  - $it") }
+                    e.file.failureTrapsAvoided.take(EXP_TRAPS_MAX_LINES).forEach {
+                        appendLine("  - ${it.take(EXP_LEARNING_MAX_CHARS)}")
+                    }
                 }
                 if (!e.file.outcomeDetail.isNullOrBlank()) {
-                    appendLine("【会话总结】${e.file.outcomeDetail.take(140)}")
+                    appendLine("【会话总结】${e.file.outcomeDetail.take(EXP_OUTCOME_DETAIL_MAX_CHARS)}")
                 }
             }
             appendLine("注意：经验里的 viewId / text / contentDesc 可能已经过时；优先以当前 snapshot 为准。")
