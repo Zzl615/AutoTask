@@ -52,7 +52,7 @@ ReAct loop：       observation → last_action_review → reflection → action
 （可选）一键转草稿：用户在 UI 点 "转任务草稿" → ExperienceToTaskConverter → FlowEditor
 ```
 
-### 三模块解耦架构（核心设计）
+### 三模块全景
 
 ```
 ┌──────────────────────────┐    ┌────────────────────────┐    ┌──────────────────────────────┐
@@ -62,12 +62,7 @@ ReAct loop：       observation → last_action_review → reflection → action
 └──────────────────────────┘ 沉淀 └────────────────────────┘ 触发 └──────────────────────────────┘
 ```
 
-- **agent 不知道也不关心"草稿"**
-- **草稿生成不知道也不关心 agent 此刻在做什么**
-- 删除经验本里某条记录不影响 agent 跑、不影响已生成的草稿
-- 这**不是**"自动 vs 手动落库"开关，是模块边界
-
-详细设计与实现见 [`aidoc/20-experience-book-design.md`](aidoc/20-experience-book-design.md) §0。
+模块边界、单向数据流、为什么要这么设计等内部细节维护在 [`aidoc/20-experience-book-design.md`](aidoc/20-experience-book-design.md) §0。
 
 ### AI Agent 内置的"防胡来"机制
 
