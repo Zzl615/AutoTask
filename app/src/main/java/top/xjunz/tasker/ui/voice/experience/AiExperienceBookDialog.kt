@@ -9,8 +9,10 @@ import android.view.View
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
 import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.color.MaterialColors
+import kotlinx.coroutines.launch
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import top.xjunz.tasker.R
 import top.xjunz.tasker.ai.agent.experience.AiAgentExperienceBook
@@ -110,21 +112,26 @@ class AiExperienceBookDialog : BaseBottomSheetDialog<DialogAiExperienceBookBindi
 
     private fun refresh() {
         val ctx = context ?: return
-        entries = AiAgentExperienceBook.queryAll(ctx)
-        binding.rvEntries.adapter = buildAdapter()
-        binding.tvEmpty.isVisible = entries.isEmpty()
-        binding.rvEntries.isVisible = entries.isNotEmpty()
-        val usage = AiAgentExperienceBook.usageBytes(ctx)
-        binding.tvUsage.text = if (entries.isEmpty()) {
-            getString(R.string.ai_experience_book_card_usage_empty)
-        } else {
-            getString(
-                R.string.format_ai_experience_book_card_usage,
-                entries.size,
-                formatBytes(usage)
-            )
+        // suspend API：经验本读盘 + 排序 + 用量统计走 Dispatchers.IO，结果在主线程更新视图
+        viewLifecycleOwner.lifecycleScope.launch {
+            entries = AiAgentExperienceBook.queryAll(ctx)
+            if (!isAdded) return@launch
+            binding.rvEntries.adapter = buildAdapter()
+            binding.tvEmpty.isVisible = entries.isEmpty()
+            binding.rvEntries.isVisible = entries.isNotEmpty()
+            val usage = AiAgentExperienceBook.usageBytes(ctx)
+            if (!isAdded) return@launch
+            binding.tvUsage.text = if (entries.isEmpty()) {
+                getString(R.string.ai_experience_book_card_usage_empty)
+            } else {
+                getString(
+                    R.string.format_ai_experience_book_card_usage,
+                    entries.size,
+                    formatBytes(usage)
+                )
+            }
+            binding.btnClear.isEnabled = entries.isNotEmpty()
         }
-        binding.btnClear.isEnabled = entries.isNotEmpty()
     }
 
     private fun showDetail(entry: ExperienceIndexEntry) {
@@ -138,23 +145,28 @@ class AiExperienceBookDialog : BaseBottomSheetDialog<DialogAiExperienceBookBindi
             return
         }
         val ctx = context ?: return
-        val task = AiAgentExperienceBook.convertToDraft(ctx, entry.filename)
-        if (task == null) {
-            toast(R.string.ai_experience_book_to_draft_empty)
-            return
+        viewLifecycleOwner.lifecycleScope.launch {
+            val task = AiAgentExperienceBook.convertToDraft(ctx, entry.filename)
+            if (!isAdded) return@launch
+            if (task == null) {
+                toast(R.string.ai_experience_book_to_draft_empty)
+                return@launch
+            }
+            FlowEditorDialog().initBase(task, false).doOnTaskEdited {
+                taskShowcaseViewModel.requestAddNewTasks.value = listOf(task)
+                toast(R.string.ai_experience_book_to_draft_success)
+            }.show(parentFragmentManager)
         }
-        FlowEditorDialog().initBase(task, false).doOnTaskEdited {
-            taskShowcaseViewModel.requestAddNewTasks.value = listOf(task)
-            toast(R.string.ai_experience_book_to_draft_success)
-        }.show(parentFragmentManager)
     }
 
     private fun confirmDelete(entry: ExperienceIndexEntry) {
         MaterialAlertDialogBuilder(requireContext())
             .setMessage(R.string.ai_experience_book_delete_confirm)
             .setPositiveButton(R.string.ai_experience_book_delete) { _, _ ->
-                AiAgentExperienceBook.delete(requireContext(), entry.filename)
-                refresh()
+                viewLifecycleOwner.lifecycleScope.launch {
+                    AiAgentExperienceBook.delete(requireContext(), entry.filename)
+                    if (isAdded) refresh()
+                }
             }
             .setNegativeButton(R.string.ai_experience_book_close, null)
             .show()
@@ -164,8 +176,10 @@ class AiExperienceBookDialog : BaseBottomSheetDialog<DialogAiExperienceBookBindi
         MaterialAlertDialogBuilder(requireContext())
             .setMessage(R.string.ai_experience_book_clear_confirm)
             .setPositiveButton(R.string.ai_experience_book_clear) { _, _ ->
-                AiAgentExperienceBook.clearAll(requireContext())
-                refresh()
+                viewLifecycleOwner.lifecycleScope.launch {
+                    AiAgentExperienceBook.clearAll(requireContext())
+                    if (isAdded) refresh()
+                }
             }
             .setNegativeButton(R.string.ai_experience_book_close, null)
             .show()

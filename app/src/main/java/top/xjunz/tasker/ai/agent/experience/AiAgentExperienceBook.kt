@@ -5,6 +5,8 @@
 package top.xjunz.tasker.ai.agent.experience
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import top.xjunz.tasker.Preferences
 import top.xjunz.tasker.ai.AiJson
@@ -59,8 +61,13 @@ object AiAgentExperienceBook {
         }
     }
 
-    /** 把一次会话写成单条经验文件并更新索引。失败不抛异常，只记 log。 */
-    fun recordSession(
+    /**
+     * 把一次会话写成单条经验文件并更新索引。失败不抛异常，只记 log。
+     *
+     * **suspend + Dispatchers.IO**：经验本所有写盘 / 索引 IO 都不能在主线程跑，
+     * 否则 agent session 结束瞬间会卡顿（VoiceCommandService 在 Main.immediate 上）。
+     */
+    suspend fun recordSession(
         context: Context,
         sessionId: String,
         userGoal: String,
@@ -76,41 +83,63 @@ object AiAgentExperienceBook {
         if (!isEnabled()) return
         ensureInitialized(context)
         val dir = dirRef ?: return
-        runCatching {
-            val exp = ExperienceFileWriter.build(
-                sessionId = sessionId,
-                userGoal = userGoal,
-                targetApps = targetApps,
-                plan = plan,
-                outcome = outcome,
-                outcomeLabel = outcomeLabel,
-                outcomeDetail = outcomeDetail,
-                history = history,
-                startedAtMillis = startedAtMillis,
-                finishedAtMillis = finishedAtMillis
-            )
-            synchronized(lock) {
-                val result = ExperienceFileWriter.writeToDir(dir, exp)
-                val current = currentIndex()
-                val merged = ExperienceIndex(
-                    version = 1,
-                    entries = current.entries + result.indexEntry
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val exp = ExperienceFileWriter.build(
+                    sessionId = sessionId,
+                    userGoal = userGoal,
+                    targetApps = targetApps,
+                    plan = plan,
+                    outcome = outcome,
+                    outcomeLabel = outcomeLabel,
+                    outcomeDetail = outcomeDetail,
+                    history = history,
+                    startedAtMillis = startedAtMillis,
+                    finishedAtMillis = finishedAtMillis
                 )
-                val evicted = evictIfOverBudget(dir, merged)
-                writeIndexToDisk(dir, evicted)
-                indexCache = evicted
-                AiAgentLog.i(
-                    "experience.write",
-                    "wrote ${result.file.name} size=${result.indexEntry.sizeBytes}B " +
-                            "total=${evicted.entries.size}"
-                )
+                synchronized(lock) {
+                    val result = ExperienceFileWriter.writeToDir(dir, exp)
+                    val current = currentIndex()
+                    val merged = ExperienceIndex(
+                        version = 1,
+                        entries = current.entries + result.indexEntry
+                    )
+                    val evicted = evictIfOverBudget(dir, merged)
+                    // **事务一致性**：只有 index.json 写盘成功才提交内存缓存。
+                    // 如果磁盘写失败（IO 错 / 满磁盘 / 权限丢失）但仍然更新 indexCache，
+                    // 进程被杀后下次启动 readIndexFromDisk 会读到旧 index.json，
+                    // 导致刚写入的 txt 文件成为 "孤儿"（磁盘有、索引无）。
+                    // 写盘失败时回滚到上一次 currentIndex，并删掉刚写出但没机会进索引的 txt
+                    // 避免持续的孤儿文件累积。
+                    val written = writeIndexToDiskOrFail(dir, evicted)
+                    if (written) {
+                        indexCache = evicted
+                        AiAgentLog.i(
+                            "experience.write",
+                            "wrote ${result.file.name} size=${result.indexEntry.sizeBytes}B " +
+                                    "total=${evicted.entries.size}"
+                        )
+                    } else {
+                        runCatching { result.file.delete() }
+                        AiAgentLog.w(
+                            "experience.write",
+                            "index.json 写盘失败，已回滚刚生成的 ${result.file.name}；indexCache 保持为旧值"
+                        )
+                    }
+                }
+            }.onFailure {
+                AiAgentLog.w("experience.write", "记经验本失败：${it.message}")
             }
-        }.onFailure {
-            AiAgentLog.w("experience.write", "记经验本失败：${it.message}")
         }
     }
 
-    fun recall(
+    /**
+     * 按 (用户 goal, 当前 App) 召回 top-N 历史经验。
+     *
+     * **suspend + Dispatchers.IO**：召回过程涉及读多个 txt 文件解析 JSON 嵌块，
+     * 不能在主线程跑。
+     */
+    suspend fun recall(
         context: Context,
         userGoal: String,
         targetApps: Set<String>,
@@ -121,73 +150,91 @@ object AiAgentExperienceBook {
         val dir = dirRef ?: return emptyList()
         val index = currentIndex().entries
         if (index.isEmpty()) return emptyList()
-        return runCatching {
-            val recaller = ExperienceRecaller(index)
-            recaller.recall(userGoal, targetApps, topN)
-                .mapNotNull { cand ->
-                    val full = loadEntryFromDisk(dir, cand.entry.filename) ?: return@mapNotNull null
-                    ExperienceRecallEntry(cand.entry, full, cand.score)
-                }
-        }.onFailure {
-            AiAgentLog.w("experience.recall", "召回失败：${it.message}")
-        }.getOrDefault(emptyList())
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val recaller = ExperienceRecaller(index)
+                recaller.recall(userGoal, targetApps, topN)
+                    .mapNotNull { cand ->
+                        val full = loadEntryFromDisk(dir, cand.entry.filename) ?: return@mapNotNull null
+                        ExperienceRecallEntry(cand.entry, full, cand.score)
+                    }
+            }.onFailure {
+                AiAgentLog.w("experience.recall", "召回失败：${it.message}")
+            }.getOrDefault(emptyList())
+        }
     }
 
-    /** 给 UI 列表用：所有索引（按时间倒序）。 */
-    fun queryAll(context: Context): List<ExperienceIndexEntry> {
+    /** 给 UI 列表用：所有索引（按时间倒序）。读 indexCache 内存即可，IO 只在 ensureInitialized 首次发生。 */
+    suspend fun queryAll(context: Context): List<ExperienceIndexEntry> {
         ensureInitialized(context)
-        return currentIndex().entries.sortedByDescending { it.finishedAtMillis }
+        // 仅读内存缓存 + sortedByDescending；首次 ensureInitialized 内的 readIndexFromDisk 也包到 IO 里
+        return withContext(Dispatchers.IO) {
+            currentIndex().entries.sortedByDescending { it.finishedAtMillis }
+        }
     }
 
-    /** 给 UI 详情用：加载完整正文。 */
-    fun loadEntry(context: Context, filename: String): ExperienceFile? {
+    /** 给 UI 详情用：加载完整正文。读盘 + 解析 JSON 嵌块都包在 IO 里。 */
+    suspend fun loadEntry(context: Context, filename: String): ExperienceFile? {
         ensureInitialized(context)
         val dir = dirRef ?: return null
-        return loadEntryFromDisk(dir, filename)
+        return withContext(Dispatchers.IO) { loadEntryFromDisk(dir, filename) }
     }
 
     /** 删一条。失败返回 false。 */
-    fun delete(context: Context, filename: String): Boolean {
+    suspend fun delete(context: Context, filename: String): Boolean {
         ensureInitialized(context)
         val dir = dirRef ?: return false
-        return synchronized(lock) {
-            val target = File(dir, filename)
-            val ok = !target.exists() || target.delete()
-            if (ok) {
-                val current = currentIndex()
-                val newIndex = ExperienceIndex(
-                    version = 1,
-                    entries = current.entries.filterNot { it.filename == filename }
-                )
-                writeIndexToDisk(dir, newIndex)
-                indexCache = newIndex
+        return withContext(Dispatchers.IO) {
+            synchronized(lock) {
+                val target = File(dir, filename)
+                val ok = !target.exists() || target.delete()
+                if (ok) {
+                    val current = currentIndex()
+                    val newIndex = ExperienceIndex(
+                        version = 1,
+                        entries = current.entries.filterNot { it.filename == filename }
+                    )
+                    if (writeIndexToDiskOrFail(dir, newIndex)) {
+                        indexCache = newIndex
+                    }
+                }
+                ok
             }
-            ok
         }
     }
 
     /** 一键清空。 */
-    fun clearAll(context: Context) {
+    suspend fun clearAll(context: Context) {
         ensureInitialized(context)
         val dir = dirRef ?: return
-        synchronized(lock) {
-            dir.listFiles()?.forEach { it.delete() }
-            dir.mkdirs()
-            val empty = ExperienceIndex(version = 1, entries = emptyList())
-            writeIndexToDisk(dir, empty)
-            indexCache = empty
+        withContext(Dispatchers.IO) {
+            synchronized(lock) {
+                // 递归删除：防止未来出现子目录而漏删
+                dir.walkBottomUp().forEach { f ->
+                    if (f != dir) runCatching { f.delete() }
+                }
+                if (!dir.exists()) dir.mkdirs()
+                val empty = ExperienceIndex(version = 1, entries = emptyList())
+                if (writeIndexToDiskOrFail(dir, empty)) {
+                    indexCache = empty
+                }
+            }
         }
     }
 
-    fun usageBytes(context: Context): Long {
+    /** 当前目录已用字节数（递归统计，防子目录漏算）。 */
+    suspend fun usageBytes(context: Context): Long {
         ensureInitialized(context)
         val dir = dirRef ?: return 0L
-        return dir.listFiles()?.sumOf { it.length() } ?: 0L
+        return withContext(Dispatchers.IO) {
+            dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        }
     }
 
-    fun convertToDraft(context: Context, filename: String): XTask? {
+    suspend fun convertToDraft(context: Context, filename: String): XTask? {
         val exp = loadEntry(context, filename) ?: return null
-        return ExperienceToTaskConverter.convert(exp)
+        // ExperienceToTaskConverter 是纯内存计算，不涉及 IO；为保持 API 一致仍 suspend
+        return exp.let { ExperienceToTaskConverter.convert(it) }
     }
 
     // ---------- 内部工具 ----------
@@ -206,11 +253,32 @@ object AiAgentExperienceBook {
     }
 
     private fun writeIndexToDisk(dir: File, index: ExperienceIndex) {
-        val f = File(dir, INDEX_NAME)
-        runCatching {
-            f.writeText(AiJson.encodeToString(index), Charsets.UTF_8)
-        }.onFailure {
-            AiAgentLog.w("experience.index", "index.json 写入失败：${it.message}")
+        writeIndexToDiskOrFail(dir, index)
+    }
+
+    /**
+     * 原子化写 index.json：先写临时文件 `index.json.tmp`，重命名成 `index.json`。
+     * 临时文件 + rename 保证：要么完全旧、要么完全新，不会出现写到一半被截断的脏数据。
+     *
+     * @return true = 真的成功落到磁盘；false = 任何环节失败（IO 异常 / rename 失败）。
+     */
+    private fun writeIndexToDiskOrFail(dir: File, index: ExperienceIndex): Boolean {
+        val target = File(dir, INDEX_NAME)
+        val tmp = File(dir, "$INDEX_NAME.tmp")
+        return runCatching {
+            tmp.writeText(AiJson.encodeToString(index), Charsets.UTF_8)
+            // File.renameTo 在同目录下通常是原子的；若 target 存在则需先删，否则部分文件系统会拒绝
+            if (target.exists() && !target.delete()) {
+                throw java.io.IOException("无法删除旧 ${target.name} 让位给新 index")
+            }
+            if (!tmp.renameTo(target)) {
+                throw java.io.IOException("renameTo 失败：${tmp.name} → ${target.name}")
+            }
+            true
+        }.getOrElse {
+            AiAgentLog.w("experience.index", "index.json 写入失败：${it.message}", it)
+            runCatching { tmp.delete() }
+            false
         }
     }
 
@@ -239,9 +307,16 @@ object AiAgentExperienceBook {
         val now = System.currentTimeMillis()
 
         fun deleteEntry(entry: ExperienceIndexEntry) {
-            File(dir, entry.filename).delete()
-            entries.removeAll { it.filename == entry.filename }
-            totalBytes -= entry.sizeBytes
+            // **事务一致性**：只有真删成功（或文件本来就不在）才更新索引；
+            // 否则保留索引条目，避免"索引无条目但文件仍占用配额"的磁盘泄漏。
+            val f = File(dir, entry.filename)
+            val deleted = !f.exists() || f.delete()
+            if (deleted) {
+                entries.removeAll { it.filename == entry.filename }
+                totalBytes -= entry.sizeBytes
+            } else {
+                AiAgentLog.w("experience.evict", "删除 ${entry.filename} 失败，保留索引条目避免孤儿配额")
+            }
         }
 
         val priorities: List<(ExperienceIndexEntry) -> Boolean> = listOf(
