@@ -16,7 +16,6 @@ import top.xjunz.tasker.ai.provider.AiProviderFactory
 import top.xjunz.tasker.engine.applet.base.AppletResult
 import top.xjunz.tasker.engine.applet.action.Action
 import top.xjunz.tasker.engine.task.TaskRuntime
-import top.xjunz.tasker.isAppProcess
 
 /**
  * 微信联系人可达性测试 Applet。
@@ -26,8 +25,7 @@ import top.xjunz.tasker.isAppProcess
  * - check_only：仅检查联系人是否存在并进入聊天页
  * - check_and_send：检查后发送一条测试消息
  *
- * **进程约束**：仅支持 A11y 模式（主进程），因为 AI Agent 依赖 Preferences
- * 和 AI Provider，这些在 :service 进程不可用。
+ * A11y / Shizuku 模式均可用。
  */
 class TestWeChatContactAction : Action() {
 
@@ -40,18 +38,13 @@ class TestWeChatContactAction : Action() {
     }
 
     override suspend fun apply(runtime: TaskRuntime): AppletResult {
-        // ① 进程检查：仅主进程可用
-        if (!isAppProcess) {
-            return AppletResult(false, "微信测试 Applet 仅支持无障碍模式（A11y），请在设置中切换工作模式后重试")
-        }
-
-        // ② AI Provider 检查
+        // ① AI Provider 检查
         val provider = AiProviderFactory.createConfiguredProvider()
         if (provider == null) {
             return AppletResult(false, "AI 服务未配置或未启用。请在「关于 → AI 驱动」中配置 Provider 和模型后再试")
         }
 
-        // ③ 解析参数
+        // ② 解析参数
         val contactName = getArgument<String>(0, runtime)?.toString()?.trim()
         if (contactName.isNullOrBlank()) {
             return AppletResult(false, "请指定微信昵称或微信号")
@@ -64,12 +57,12 @@ class TestWeChatContactAction : Action() {
             return AppletResult(false, "「检查并发送消息」模式需要填写消息内容")
         }
 
-        // ④ 构造精确 Prompt
+        // ③ 构造精确 Prompt
         val goal = buildGoal(contactName, actionType, message)
 
         AiAgentLog.i("wechat.test", "开始测试微信联系人可达性：contact=$contactName, action=$actionType")
 
-        // ⑤ 创建 AiTaskScope
+        // ④ 创建 AiTaskScope
         val scope = AiTaskScope(
             sessionId = "wechat_test_${System.currentTimeMillis()}",
             userGoal = goal,
@@ -84,7 +77,7 @@ class TestWeChatContactAction : Action() {
             maxDurationSeconds = MAX_DURATION_SECONDS
         )
 
-        // ⑥ 创建并运行 AiAgentSession（overlay=null → 自动批准所有动作）
+        // ⑤ 创建并运行 AiAgentSession（overlay=null → 自动批准所有动作）
         val session = AiAgentSession(
             scope = scope,
             plan = null,
@@ -105,7 +98,7 @@ class TestWeChatContactAction : Action() {
             experiences = emptyList()
         )
 
-        // ⑦ 执行 session
+        // ⑥ 执行 session
         val outcome = try {
             session.run()
         } catch (e: Exception) {
@@ -113,7 +106,7 @@ class TestWeChatContactAction : Action() {
             return AppletResult(false, "微信测试执行异常：${e.message}")
         }
 
-        // ⑧ 映射 outcome → AppletResult
+        // ⑦ 映射 outcome → AppletResult
         return mapOutcomeToResult(outcome, contactName, actionType)
     }
 
